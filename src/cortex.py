@@ -1,0 +1,606 @@
+import json
+import logging
+import os
+import sqlite3
+import time
+import uuid
+from dataclasses import asdict, dataclass
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any, Optional
+
+try:
+    from openai import OpenAI
+except ImportError:  # pragma: no cover - handled gracefully at runtime
+    OpenAI = None  # type: ignore[assignment]
+
+logger = logging.getLogger("cerebellum.cortex")
+
+
+@dataclass
+class Hypothesis:
+    id: str
+    timestamp: str
+    title: str
+    description: str
+    confidence: float
+    utility: float
+    cost: float
+    reversibility: str
+    plan: list[str]
+    tools_required: list[str]
+    context_summary: str
+    state: str
+    metadata: dict[str, Any]
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+class PrefrontalCortex:
+    """Hypothesis generation engine."""
+
+    DEFAULT_MODELS = ["openai/gpt-5.5", "anthropic/claude-opus-4.7"]
+    VALID_STATES = {"proposed", "staged", "executed", "rejected", "expired"}
+    VALID_REVERSIBILITY = {"full", "partial", "none"}
+
+    def __init__(self, config_path: str, emitter=None, hippocampus=None):
+        self.config_path = Path(config_path).expanduser()
+        self.base_dir = self.config_path.parent
+        self.db_path = self.base_dir / "hypotheses.db"
+        self.emitter = emitter
+        self.hippocampus = hippocampus
+        self.api_key = os.getenv("OPENROUTER_API_KEY", "").strip()
+        self.config = self._load_config()
+        self.model_candidates = self.config.get("models") or self.DEFAULT_MODELS
+        self.openrouter_base_url = self.config.get(
+            "openrouter_base_url", "https://openrouter.ai/api/v1"
+        )
+        self.generation_interval_minutes = int(self.config.get("generation_interval_minutes", 5))
+        self.app_name = self.config.get("app_name", "CEREBELLUM")
+        self.site_url = self.config.get("site_url")
+        self._client = self._build_client()
+        self._init_db()
+
+    def _load_config(self) -> dict[str, Any]:
+        try:
+            if not self.config_path.exists():
+                logger.warning("Cortex config not found at %s; using defaults", self.config_path)
+                return {}
+            return json.loads(self.config_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            logger.error("Failed to load cortex config %s: %s", self.config_path, exc)
+            return {}
+
+    def _build_client(self):
+        if not self.api_key:
+            logger.warning("OPENROUTER_API_KEY is not set; LLM generation disabled")
+            return None
+        if OpenAI is None:
+            logger.error("openai package is not installed; LLM generation disabled")
+            return None
+        try:
+            headers = {"HTTP-Referer": self.site_url or "https://localhost/cerebellum", "X-Title": self.app_name}
+            return OpenAI(api_key=self.api_key, base_url=self.openrouter_base_url, default_headers=headers)
+        except Exception as exc:
+            logger.error("Failed to initialize OpenRouter client: %s", exc)
+            return None
+
+    def _get_connection(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        return conn
+
+    def _init_db(self):
+        try:
+            self.base_dir.mkdir(parents=True, exist_ok=True)
+            with self._get_connection() as conn:
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS hypotheses (
+                      id TEXT PRIMARY KEY,
+                      timestamp TEXT,
+                      title TEXT,
+                      description TEXT,
+                      confidence REAL,
+                      utility REAL,
+                      cost REAL,
+                      reversibility TEXT,
+                      plan TEXT,
+                      tools_required TEXT,
+                      context_summary TEXT,
+                      state TEXT DEFAULT 'proposed',
+                      metadata TEXT,
+                      created_at TEXT DEFAULT (datetime('now')),
+                      updated_at TEXT DEFAULT (datetime('now'))
+                    )
+                    """
+                )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_hypotheses_state_timestamp ON hypotheses(state, timestamp DESC)"
+                )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_hypotheses_created_at ON hypotheses(created_at DESC)"
+                )
+                conn.commit()
+        except Exception as exc:
+            logger.error("Failed to initialize hypotheses DB at %s: %s", self.db_path, exc)
+
+    def generate_hypotheses(self) -> list[Hypothesis]:
+        """Main method: generate hypotheses from current state."""
+        try:
+            episodes = self._get_recent_episodes(hours=2)
+            events = self._get_recent_events(minutes=30)
+            existing = self.get_active_hypotheses(state="proposed", limit=25)
+            prompt = self._build_prompt(episodes=episodes, events=events, existing=existing)
+            raw_hypotheses = self._call_llm(prompt)
+            if not raw_hypotheses:
+                return []
+
+            stored: list[Hypothesis] = []
+            for item in raw_hypotheses:
+                hypothesis = self._coerce_hypothesis(item, episodes=episodes, events=events)
+                if hypothesis is None:
+                    continue
+                if self._is_duplicate(hypothesis, existing + [entry.to_dict() for entry in stored]):
+                    logger.info("Skipping duplicate hypothesis candidate: %s", hypothesis.title)
+                    continue
+                if self._store_hypothesis(hypothesis):
+                    stored.append(hypothesis)
+                    self._emit_event(
+                        "cerebellum.hypothesis",
+                        {
+                            "id": hypothesis.id,
+                            "state": hypothesis.state,
+                            "title": hypothesis.title,
+                            "confidence": hypothesis.confidence,
+                            "utility": hypothesis.utility,
+                        },
+                    )
+            return stored
+        except Exception as exc:
+            logger.error("Failed to generate hypotheses: %s", exc, exc_info=True)
+            return []
+
+    def _build_prompt(self, episodes: list, events: list, existing: list) -> str:
+        """Build the hypothesis generation prompt."""
+        try:
+            existing_titles = [str(item.get("title", "")).strip() for item in existing][:10]
+            payload = {
+                "recent_episodes": episodes[-12:],
+                "recent_events": events[-25:],
+                "existing_hypotheses": [
+                    {
+                        "title": item.get("title"),
+                        "description": item.get("description"),
+                        "state": item.get("state"),
+                    }
+                    for item in existing[:10]
+                ],
+                "generation_interval_minutes": self.generation_interval_minutes,
+                "current_time": datetime.now(timezone.utc).isoformat(),
+            }
+            return (
+                "You are the prefrontal cortex for CEREBELLUM, a shadow cognition layer for RASPUTIN. "
+                "Analyze recent system behavior and propose a small set of high-value hypotheses about useful next actions, risks, or follow-up work.\n\n"
+                "Rules:\n"
+                "1. Return ONLY valid JSON. No markdown, no prose, no code fences.\n"
+                "2. The JSON must be an array of 0 to 5 objects.\n"
+                "3. Every object must include exactly these keys: title, description, confidence, utility, cost, reversibility, plan, tools_required, context_summary, metadata.\n"
+                "4. confidence, utility, and cost must be calibrated floats between 0.0 and 1.0. Avoid inflated confidence.\n"
+                "5. reversibility must be one of: full, partial, none.\n"
+                "6. plan must be a concrete ordered array of short executable steps, not vague intentions.\n"
+                "7. tools_required must name real tools, systems, or capabilities needed to execute the plan.\n"
+                "8. context_summary must concisely explain the evidence that triggered the hypothesis.\n"
+                "9. metadata must be a JSON object with optional supporting details such as observed_patterns, risk_level, or estimated_minutes.\n"
+                "10. Only generate SPECIFIC and ACTIONABLE hypotheses with plausible user value in the next hour to day.\n"
+                "11. Avoid duplicates or near-duplicates of existing hypotheses, especially these titles: "
+                f"{existing_titles or ['none']}.\n"
+                "12. Prefer hypotheses that either unblock ongoing work, surface hidden risk, or capitalize on clear opportunities.\n"
+                "13. If the context is too weak, return an empty array.\n\n"
+                "Context JSON:\n"
+                f"{json.dumps(payload, ensure_ascii=False, indent=2)}"
+            )
+        except Exception as exc:
+            logger.error("Failed to build hypothesis prompt: %s", exc)
+            return "Return an empty JSON array: []"
+
+    def _call_llm(self, prompt: str) -> list[dict]:
+        """Call OpenRouter API for hypothesis generation."""
+        if self._client is None:
+            return []
+
+        for model in self.model_candidates:
+            for attempt in range(3):
+                try:
+                    response = self._client.chat.completions.create(
+                        model=model,
+                        temperature=0.3,
+                        messages=[
+                            {
+                                "role": "system",
+                                "content": "You produce rigorous, structured hypothesis proposals as strict JSON.",
+                            },
+                            {"role": "user", "content": prompt},
+                        ],
+                    )
+                    content = self._clean_json_content(self._extract_message_content(response))
+                    parsed = json.loads(content)
+                    hypotheses = parsed.get("hypotheses") if isinstance(parsed, dict) else parsed
+                    if isinstance(hypotheses, list):
+                        return [item for item in hypotheses if isinstance(item, dict)]
+                    logger.error("LLM returned non-list payload for model %s", model)
+                    return []
+                except Exception as exc:
+                    if attempt >= 2:
+                        logger.error("LLM call failed for model %s after retries: %s", model, exc)
+                        break
+                    delay = 2**attempt
+                    logger.warning(
+                        "LLM call failed for model %s on attempt %s/3: %s; retrying in %ss",
+                        model,
+                        attempt + 1,
+                        exc,
+                        delay,
+                    )
+                    time.sleep(delay)
+        return []
+
+    def _extract_message_content(self, response: Any) -> str:
+        try:
+            message = response.choices[0].message
+            content = message.content
+            if isinstance(content, str):
+                return content
+            if isinstance(content, list):
+                fragments: list[str] = []
+                for chunk in content:
+                    if isinstance(chunk, dict) and chunk.get("type") == "text":
+                        fragments.append(str(chunk.get("text", "")))
+                    else:
+                        text_value = getattr(chunk, "text", None)
+                        if text_value:
+                            fragments.append(str(text_value))
+                return "".join(fragments)
+            return str(content)
+        except Exception as exc:
+            raise ValueError(f"Unable to extract LLM content: {exc}") from exc
+
+    def _clean_json_content(self, content: str) -> str:
+        stripped = content.strip()
+        if stripped.startswith("```"):
+            lines = stripped.splitlines()
+            if lines and lines[0].startswith("```"):
+                lines = lines[1:]
+            if lines and lines[-1].strip() == "```":
+                lines = lines[:-1]
+            stripped = "\n".join(lines).strip()
+        return stripped
+
+    def get_active_hypotheses(self, state: Optional[str] = None, limit: int = 50) -> list[dict]:
+        """Query hypotheses by state."""
+        try:
+            sql = "SELECT * FROM hypotheses"
+            params: list[Any] = []
+            if state:
+                sql += " WHERE state = ?"
+                params.append(state)
+            sql += " ORDER BY timestamp DESC, created_at DESC LIMIT ?"
+            params.append(max(1, limit))
+            with self._get_connection() as conn:
+                rows = conn.execute(sql, params).fetchall()
+            return [self._row_to_dict(row) for row in rows]
+        except Exception as exc:
+            logger.error("Failed to query hypotheses: %s", exc)
+            return []
+
+    def get_hypothesis(self, hypothesis_id: str) -> Optional[dict[str, Any]]:
+        try:
+            with self._get_connection() as conn:
+                row = conn.execute("SELECT * FROM hypotheses WHERE id = ?", (hypothesis_id,)).fetchone()
+            return self._row_to_dict(row) if row else None
+        except Exception as exc:
+            logger.error("Failed to fetch hypothesis %s: %s", hypothesis_id, exc)
+            return None
+
+    def update_hypothesis_state(self, hypothesis_id: str, new_state: str, reason: str = "") -> bool:
+        """Update hypothesis state, emit event."""
+        try:
+            if new_state not in self.VALID_STATES:
+                raise ValueError(f"Invalid hypothesis state: {new_state}")
+            hypothesis = self.get_hypothesis(hypothesis_id)
+            if not hypothesis:
+                return False
+            metadata = hypothesis.get("metadata") or {}
+            transitions = metadata.get("state_transitions", [])
+            transitions.append(
+                {
+                    "from": hypothesis.get("state"),
+                    "to": new_state,
+                    "reason": reason,
+                    "at": datetime.now(timezone.utc).isoformat(),
+                }
+            )
+            metadata["state_transitions"] = transitions
+            with self._get_connection() as conn:
+                conn.execute(
+                    """
+                    UPDATE hypotheses
+                    SET state = ?, metadata = ?, updated_at = datetime('now')
+                    WHERE id = ?
+                    """,
+                    (new_state, json.dumps(metadata, ensure_ascii=False), hypothesis_id),
+                )
+                conn.commit()
+            self._emit_event(
+                "cerebellum.hypothesis.state_changed",
+                {"id": hypothesis_id, "from": hypothesis.get("state"), "to": new_state, "reason": reason},
+            )
+            return True
+        except Exception as exc:
+            logger.error("Failed to update hypothesis %s to %s: %s", hypothesis_id, new_state, exc)
+            return False
+
+    def expire_old_hypotheses(self, max_age_hours: int = 24) -> int:
+        """Mark old 'proposed' hypotheses as 'expired'."""
+        try:
+            cutoff = (datetime.now(timezone.utc) - timedelta(hours=max_age_hours)).isoformat()
+            expired_ids: list[str] = []
+            with self._get_connection() as conn:
+                rows = conn.execute(
+                    "SELECT id FROM hypotheses WHERE state = 'proposed' AND timestamp < ?",
+                    (cutoff,),
+                ).fetchall()
+                expired_ids = [str(row["id"]) for row in rows]
+                if expired_ids:
+                    conn.execute(
+                        """
+                        UPDATE hypotheses
+                        SET state = 'expired', updated_at = datetime('now')
+                        WHERE state = 'proposed' AND timestamp < ?
+                        """,
+                        (cutoff,),
+                    )
+                    conn.commit()
+            for hypothesis_id in expired_ids:
+                self._emit_event(
+                    "cerebellum.hypothesis.expired",
+                    {"id": hypothesis_id, "cutoff": cutoff, "max_age_hours": max_age_hours},
+                )
+            return len(expired_ids)
+        except Exception as exc:
+            logger.error("Failed to expire old hypotheses: %s", exc)
+            return 0
+
+    def get_hypothesis_stats(self) -> dict:
+        """Return counts by state, avg confidence, etc."""
+        try:
+            with self._get_connection() as conn:
+                counts = {
+                    row["state"]: row["count"]
+                    for row in conn.execute(
+                        "SELECT state, COUNT(*) AS count FROM hypotheses GROUP BY state"
+                    ).fetchall()
+                }
+                aggregates = conn.execute(
+                    """
+                    SELECT COUNT(*) AS total,
+                           AVG(confidence) AS avg_confidence,
+                           AVG(utility) AS avg_utility,
+                           AVG(cost) AS avg_cost
+                    FROM hypotheses
+                    """
+                ).fetchone()
+            return {
+                "counts_by_state": counts,
+                "total": int(aggregates["total"] or 0),
+                "avg_confidence": round(float(aggregates["avg_confidence"] or 0.0), 3),
+                "avg_utility": round(float(aggregates["avg_utility"] or 0.0), 3),
+                "avg_cost": round(float(aggregates["avg_cost"] or 0.0), 3),
+                "generated_at": datetime.now(timezone.utc).isoformat(),
+            }
+        except Exception as exc:
+            logger.error("Failed to compute hypothesis stats: %s", exc)
+            return {
+                "counts_by_state": {},
+                "total": 0,
+                "avg_confidence": 0.0,
+                "avg_utility": 0.0,
+                "avg_cost": 0.0,
+                "generated_at": datetime.now(timezone.utc).isoformat(),
+            }
+
+    def _get_recent_episodes(self, hours: int) -> list[dict[str, Any]]:
+        if not self.hippocampus:
+            return []
+        since = datetime.now(timezone.utc) - timedelta(hours=hours)
+        for method_name, kwargs in (
+            ("get_recent_episodes", {"since": since}),
+            ("get_recent_episodes", {"hours": hours}),
+            ("query", {"limit": 20, "since": since.isoformat()}),
+        ):
+            method = getattr(self.hippocampus, method_name, None)
+            if not callable(method):
+                continue
+            try:
+                result = method(**kwargs)
+                return self._normalize_records(result)
+            except TypeError:
+                continue
+            except Exception as exc:
+                logger.warning("Failed fetching episodes via %s: %s", method_name, exc)
+        return []
+
+    def _get_recent_events(self, minutes: int) -> list[dict[str, Any]]:
+        if not self.emitter:
+            return []
+        since = datetime.now(timezone.utc) - timedelta(minutes=minutes)
+        for method_name, kwargs in (
+            ("get_recent_events", {"since": since}),
+            ("get_recent_events", {"minutes": minutes}),
+            ("list_recent_events", {"minutes": minutes}),
+            ("query_recent_events", {"since": since.isoformat(), "limit": 50}),
+        ):
+            method = getattr(self.emitter, method_name, None)
+            if not callable(method):
+                continue
+            try:
+                result = method(**kwargs)
+                return self._normalize_records(result)
+            except TypeError:
+                continue
+            except Exception as exc:
+                logger.warning("Failed fetching events via %s: %s", method_name, exc)
+        return []
+
+    def _normalize_records(self, value: Any) -> list[dict[str, Any]]:
+        if value is None:
+            return []
+        if isinstance(value, dict):
+            if isinstance(value.get("episodes"), list):
+                return [self._json_safe(item) for item in value["episodes"]]
+            if isinstance(value.get("events"), list):
+                return [self._json_safe(item) for item in value["events"]]
+            return [self._json_safe(value)]
+        if isinstance(value, list):
+            return [self._json_safe(item) for item in value]
+        return [self._json_safe(value)]
+
+    def _json_safe(self, value: Any) -> dict[str, Any]:
+        if isinstance(value, dict):
+            return {str(key): self._coerce_json_value(item) for key, item in value.items()}
+        if hasattr(value, "to_dict") and callable(value.to_dict):
+            return self._json_safe(value.to_dict())
+        if hasattr(value, "__dict__"):
+            return self._json_safe(vars(value))
+        return {"value": self._coerce_json_value(value)}
+
+    def _coerce_json_value(self, value: Any) -> Any:
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            return value
+        if isinstance(value, list):
+            return [self._coerce_json_value(item) for item in value]
+        if isinstance(value, dict):
+            return {str(key): self._coerce_json_value(item) for key, item in value.items()}
+        if isinstance(value, datetime):
+            return value.isoformat()
+        return str(value)
+
+    def _coerce_hypothesis(self, item: dict[str, Any], episodes: list, events: list) -> Optional[Hypothesis]:
+        try:
+            title = str(item.get("title", "")).strip()
+            description = str(item.get("description", "")).strip()
+            plan = [str(step).strip() for step in item.get("plan", []) if str(step).strip()]
+            tools_required = [
+                str(tool).strip() for tool in item.get("tools_required", []) if str(tool).strip()
+            ]
+            if not title or not description or not plan:
+                raise ValueError("Hypothesis missing required content")
+            reversibility = str(item.get("reversibility", "partial")).strip().lower()
+            if reversibility not in self.VALID_REVERSIBILITY:
+                reversibility = "partial"
+            context_summary = str(item.get("context_summary", "")).strip() or self._fallback_context_summary(
+                episodes, events
+            )
+            metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+            metadata.setdefault("source", "llm")
+            metadata.setdefault("model_candidates", self.model_candidates)
+            return Hypothesis(
+                id=str(uuid.uuid4()),
+                timestamp=datetime.now(timezone.utc).isoformat(),
+                title=title,
+                description=description,
+                confidence=self._clamp_float(item.get("confidence", 0.0)),
+                utility=self._clamp_float(item.get("utility", 0.0)),
+                cost=self._clamp_float(item.get("cost", 0.0)),
+                reversibility=reversibility,
+                plan=plan,
+                tools_required=tools_required,
+                context_summary=context_summary,
+                state="proposed",
+                metadata=metadata,
+            )
+        except Exception as exc:
+            logger.warning("Discarding invalid hypothesis payload %s: %s", item, exc)
+            return None
+
+    def _fallback_context_summary(self, episodes: list, events: list) -> str:
+        return (
+            f"Derived from {len(episodes)} recent episodes and {len(events)} recent events observed by CEREBELLUM."
+        )
+
+    def _clamp_float(self, value: Any) -> float:
+        try:
+            return round(max(0.0, min(1.0, float(value))), 3)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _is_duplicate(self, hypothesis: Hypothesis, existing: list[dict[str, Any]]) -> bool:
+        normalized_title = hypothesis.title.strip().lower()
+        for item in existing:
+            title = str(item.get("title", "")).strip().lower()
+            description = str(item.get("description", "")).strip().lower()
+            if title == normalized_title:
+                return True
+            if normalized_title and normalized_title in description:
+                return True
+        return False
+
+    def _store_hypothesis(self, hypothesis: Hypothesis) -> bool:
+        try:
+            with self._get_connection() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO hypotheses (
+                        id, timestamp, title, description, confidence, utility, cost,
+                        reversibility, plan, tools_required, context_summary, state, metadata
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        hypothesis.id,
+                        hypothesis.timestamp,
+                        hypothesis.title,
+                        hypothesis.description,
+                        hypothesis.confidence,
+                        hypothesis.utility,
+                        hypothesis.cost,
+                        hypothesis.reversibility,
+                        json.dumps(hypothesis.plan, ensure_ascii=False),
+                        json.dumps(hypothesis.tools_required, ensure_ascii=False),
+                        hypothesis.context_summary,
+                        hypothesis.state,
+                        json.dumps(hypothesis.metadata, ensure_ascii=False),
+                    ),
+                )
+                conn.commit()
+            return True
+        except Exception as exc:
+            logger.error("Failed to store hypothesis %s: %s", hypothesis.id, exc)
+            return False
+
+    def _row_to_dict(self, row: sqlite3.Row) -> dict[str, Any]:
+        result = dict(row)
+        result["plan"] = self._parse_json_column(result.get("plan"), [])
+        result["tools_required"] = self._parse_json_column(result.get("tools_required"), [])
+        result["metadata"] = self._parse_json_column(result.get("metadata"), {})
+        return result
+
+    def _parse_json_column(self, value: Any, fallback: Any) -> Any:
+        try:
+            return json.loads(value) if value else fallback
+        except Exception:
+            return fallback
+
+    def _emit_event(self, event_type: str, payload: dict[str, Any]) -> None:
+        if not self.emitter:
+            return
+        try:
+            if hasattr(self.emitter, "emit") and callable(self.emitter.emit):
+                self.emitter.emit(event_type, payload=payload, actor="cerebellum.cortex", context={"source": "phase3"})
+                return
+            if hasattr(self.emitter, "publish") and callable(self.emitter.publish):
+                self.emitter.publish(event_type, payload)
+        except Exception as exc:
+            logger.warning("Failed to emit event %s: %s", event_type, exc)

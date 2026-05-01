@@ -1,0 +1,48 @@
+# CEREBELLUM Action Policy
+# Controls which hypotheses are auto-executed vs staged for approval
+
+global:
+  enabled: true
+  max_actions_per_hour: 10
+  max_llm_cost_per_day_usd: 5.0
+  kill_switch_command: "/cerebellum-halt"
+
+# Auto-execute: reversible, low-cost, high-confidence actions
+auto_execute:
+  min_confidence: 0.85
+  max_cost: 0.3
+  required_reversibility: ["full", "partial"]
+  allowed_tools:
+    - "browser.screenshot"
+    - "browser.navigate"
+    - "web.search"
+    - "file.read"
+    - "memory.query"
+    - "model.call"
+    - "notification.send"
+
+# Stage & notify: everything else that passes thresholds
+stage_notify:
+  min_confidence: 0.6
+  max_cost: 0.8
+  telegram:
+    format: "card"  # card | text
+    timeout_minutes: 60  # auto-reject after timeout
+    buttons:
+      - "✅ Approve"
+      - "❌ Reject"
+      - "⏰ Snooze 1h"
+      - "❓ Explain"
+
+# Discard: below thresholds
+discard:
+  max_confidence: 0.5
+  min_cost: 0.9
+
+# Forbidden actions (never auto-execute)
+forbidden_tools:
+  - "file.write"
+  - "file.delete"
+  - "system.exec"
+  - "docker.kill"
+  - "database.drop"

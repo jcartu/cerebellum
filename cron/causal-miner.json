@@ -1,0 +1,8 @@
+{
+  "name": "cerebellum-causal-miner",
+  "schedule": "0 3 * * 0",
+  "enabled": true,
+  "model": "ollama-gpu1/qwen3.5-35b",
+  "prompt": "Run the causal edge miner. Analyze the last week of events to discover causal patterns.",
+  "script": "/home/josh/.openclaw/cerebellum/scripts/mine_causal_edges.py"
+}

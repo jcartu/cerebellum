@@ -1,0 +1,8 @@
+{
+  "name": "cerebellum-hippocampus-cluster",
+  "schedule": "*/15 * * * *",
+  "enabled": true,
+  "model": "ollama-gpu1/qwen3.5-35b",
+  "prompt": "Run the hippocampus episodic clusterer. Query events from the last 15 minutes, cluster them into episodes, and store in the graph.",
+  "script": "/home/josh/.openclaw/cerebellum/scripts/cluster_episodes.py"
+}

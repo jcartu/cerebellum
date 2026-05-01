@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Runtime databases
+events.db
+events.db-shm
+events.db-wal
+hypotheses.db
+hypotheses.db-shm
+hypotheses.db-wal
+feedback.db
+
+# Graph database
+graph/
+
+# Environment
+.env
+.venv/

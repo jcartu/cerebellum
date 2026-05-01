@@ -1,0 +1,6 @@
+{
+  "nats": { "host": "localhost", "port": 4222, "jetstream_domain": "" },
+  "sqlite": { "events_db": "/home/josh/.openclaw/cerebellum/events.db" },
+  "event_types": ["cron.start", "cron.end", "cron.error", "telegram.inbound", "telegram.outbound", "browser.action", "model.call", "memory.write", "file.edit", "gpu.state", "cerebellum.hypothesis", "cerebellum.action", "cerebellum.approval"],
+  "dashboard": { "port": 18790 }
+}

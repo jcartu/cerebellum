@@ -1,0 +1,8 @@
+{
+  "name": "cerebellum-cortex-generate",
+  "schedule": "*/5 * * * *",
+  "enabled": true,
+  "model": "openrouter/openai/gpt-5.5",
+  "prompt": "Run the cerebellum hypothesis generator.",
+  "script": "/home/josh/.openclaw/cerebellum/scripts/generate_hypotheses.py"
+}
