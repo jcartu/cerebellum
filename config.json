@@ -2,5 +2,14 @@
   "nats": { "host": "localhost", "port": 4222, "jetstream_domain": "" },
   "sqlite": { "events_db": "/home/josh/.openclaw/cerebellum/events.db" },
   "event_types": ["cron.start", "cron.end", "cron.error", "telegram.inbound", "telegram.outbound", "browser.action", "model.call", "memory.write", "file.edit", "gpu.state", "cerebellum.hypothesis", "cerebellum.action", "cerebellum.approval"],
-  "dashboard": { "port": 18790 }
+  "dashboard": { "port": 18790 },
+  "hippocampus": {
+    "openrouter_url": "https://openrouter.ai/api/v1/chat/completions",
+    "openrouter_model": "openai/gpt-5.5"
+  },
+  "models": ["openai/gpt-5.5", "anthropic/claude-opus-4.7"],
+  "openrouter_base_url": "https://openrouter.ai/api/v1",
+  "generation_interval_minutes": 5,
+  "app_name": "CEREBELLUM",
+  "site_url": "https://localhost/cerebellum"
 }

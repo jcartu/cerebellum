@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import re
 import threading
 import urllib.error
@@ -11,16 +12,15 @@ from collections import Counter
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
-
 import kuzu
+from typing import Any
 
 
 logger = logging.getLogger("cerebellum.hippocampus")
 
 
 @dataclass(slots=True)
-class OllamaResponse:
+class LLMResponse:
     text: str
     raw: dict[str, Any]
 
@@ -29,8 +29,8 @@ class Hippocampus:
     """Causal memory engine using KuzuDB graph + Qdrant vectors."""
 
     GRAPH_DIR = Path("/home/josh/.openclaw/cerebellum/graph")
-    DEFAULT_OLLAMA_URL = "http://localhost:11436/api/generate"
-    DEFAULT_OLLAMA_MODEL = "qwen3.5:35b"
+    DEFAULT_OPENROUTER_MODEL = "openai/gpt-5.5"
+    DEFAULT_OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
     _READ_ONLY_QUERY_PREFIXES = ("MATCH", "WITH", "RETURN", "CALL", "UNWIND")
     _READ_ONLY_BLOCKLIST = re.compile(r"\b(CREATE|MERGE|DELETE|DETACH|SET|DROP|COPY|LOAD|REMOVE)\b", re.IGNORECASE)
 
@@ -48,8 +48,9 @@ class Hippocampus:
             self.db_path = configured_graph_path / "hippocampus.kuzu"
         self.graph_dir.mkdir(parents=True, exist_ok=True)
 
-        self.ollama_url = self.config.get("hippocampus", {}).get("ollama_url", self.DEFAULT_OLLAMA_URL)
-        self.ollama_model = self.config.get("hippocampus", {}).get("ollama_model", self.DEFAULT_OLLAMA_MODEL)
+        self.openrouter_api_key = os.environ.get("OPENROUTER_API_KEY", "").strip()
+        self.openrouter_url = self.config.get("hippocampus", {}).get("openrouter_url", self.DEFAULT_OPENROUTER_URL)
+        self.openrouter_model = self.config.get("hippocampus", {}).get("openrouter_model", self.DEFAULT_OPENROUTER_MODEL)
 
         self._db = kuzu.Database(str(self.db_path))
         self._thread_local = threading.local()
@@ -167,15 +168,15 @@ class Hippocampus:
         )
 
         try:
-            response = self._call_ollama(prompt)
+            response = self._call_llm(prompt)
             parsed = self._extract_json_object(response.text)
             title = str(parsed.get("title", "")).strip()
             summary = str(parsed.get("summary", "")).strip()
             if title and summary:
                 return title[:120], summary[:600]
-            raise ValueError("Ollama summary response missing title or summary")
+            raise ValueError("LLM summary response missing title or summary")
         except Exception as exc:
-            logger.warning("Ollama summarization failed; using heuristic fallback: %s", exc)
+            logger.warning("LLM summarization failed; using heuristic fallback: %s", exc)
             return self._heuristic_episode_summary(events)
 
     def extract_entities(self, payload: dict[str, Any]) -> list[dict[str, str]]:
@@ -638,58 +639,45 @@ User request: {natural_language}
 """.strip()
 
         try:
-            response = self._call_ollama(prompt)
+            response = self._call_llm(prompt)
             parsed = self._extract_json_object(response.text)
             query = str(parsed.get("query", "")).strip()
             return query or None
         except Exception as exc:
-            logger.warning("Failed to generate NL query via Ollama: %s", exc)
+            logger.warning("Failed to generate NL query via LLM: %s", exc)
             return None
 
-    def _call_ollama(self, prompt: str) -> OllamaResponse:
-        native_payload = {
-            "model": self.ollama_model,
-            "prompt": prompt,
-            "stream": False,
-            "options": {"temperature": 0.2},
-        }
-        try:
-            return self._post_json(self.ollama_url, native_payload, response_key="response")
-        except RuntimeError as exc:
-            if "404" not in str(exc):
-                raise
+    def _call_llm(self, prompt: str) -> LLMResponse:
+        if not self.openrouter_api_key:
+            raise RuntimeError("OPENROUTER_API_KEY is not set")
 
-        openai_url = self._derive_openai_url(self.ollama_url)
-        openai_payload = {
-            "model": self.ollama_model,
+        payload = {
+            "model": self.openrouter_model,
             "messages": [{"role": "user", "content": prompt}],
             "temperature": 0.2,
         }
-        return self._post_json(openai_url, openai_payload, response_key="choices.0.message.content")
-
-    def _post_json(self, url: str, payload: dict[str, Any], response_key: str) -> OllamaResponse:
         request = urllib.request.Request(
-            url,
+            self.openrouter_url,
             data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {self.openrouter_api_key}",
+                "HTTP-Referer": "https://localhost/cerebellum",
+                "X-Title": "CEREBELLUM",
+            },
             method="POST",
         )
 
         try:
-            with urllib.request.urlopen(request, timeout=45) as response:
+            with urllib.request.urlopen(request, timeout=60) as response:
                 response_payload = json.loads(response.read().decode("utf-8"))
         except (TimeoutError, urllib.error.URLError, urllib.error.HTTPError, json.JSONDecodeError) as exc:
-            raise RuntimeError(f"Ollama request failed: {exc}") from exc
+            raise RuntimeError(f"OpenRouter request failed: {exc}") from exc
 
-        text = self._read_nested_key(response_payload, response_key)
+        text = self._read_nested_key(response_payload, "choices.0.message.content")
         if not isinstance(text, str) or not text.strip():
-            raise RuntimeError(f"Ollama response missing text at {response_key}")
-        return OllamaResponse(text=text.strip(), raw=response_payload)
-
-    def _derive_openai_url(self, url: str) -> str:
-        if url.endswith("/api/generate"):
-            return url[: -len("/api/generate")] + "/v1/chat/completions"
-        return url.rstrip("/") + "/v1/chat/completions"
+            raise RuntimeError("OpenRouter response missing text")
+        return LLMResponse(text=text.strip(), raw=response_payload)
 
     def _read_nested_key(self, payload: dict[str, Any], key_path: str) -> Any:
         current: Any = payload
