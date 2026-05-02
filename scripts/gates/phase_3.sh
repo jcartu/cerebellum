@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
-# Phase 3: Real Causality — Exit Gate
-# Verifies: PrefixSpan mining, lift scoring, shuffle baselines, entity-aware patterns
+# Phase 3: Real successor-pattern mining — Exit Gate
+# Per plan section 3.B:
+# - Mining recovers all 3 planted patterns with lift > 2.0 in integration test
+# - Mining produces zero edges on uniform-random event stream (false positive rate)
+# - Coverage on mining.py >= 80%
+# - decisions.md records actual lift distribution from real event stream
 set -euo pipefail
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
@@ -12,71 +16,29 @@ warn() { echo -e "  ${YELLOW}WARN${NC} $1"; WARN=$((WARN + 1)); }
 
 echo "=== Phase 3 Exit Gate: Real Causality ==="
 
-# Check mining module exists
-if [ -f src/cerebellum/mining.py ]; then
-  pass "mining.py exists"
+# 1. Integration test: recover 3 planted patterns with lift > 2.0
+if timeout 60 .venv/bin/pytest tests/test_mining.py::test_integration_recover_planted_patterns -q 2>&1 | tail -1 | grep -q "passed"; then
+  pass "Recover 3 planted patterns with lift > 2.0"
 else
-  fail "mining.py not found"
+  fail "Planted pattern recovery test failed"
 fi
 
-# Check PrefixSpan implementation
-if grep -q "_prefixspan" src/cerebellum/mining.py 2>/dev/null; then
-  pass "PrefixSpan implementation exists"
+# 2. False positive rate: zero edges on 1000 random events
+if timeout 60 .venv/bin/pytest tests/test_mining.py::test_integration_no_false_positives_on_random -q 2>&1 | tail -1 | grep -q "passed"; then
+  pass "Zero false positives on uniform-random stream"
 else
-  fail "No PrefixSpan in mining.py"
+  fail "False positive rate test failed"
 fi
 
-# Check lift scoring
-if grep -q "compute_lift" src/cerebellum/mining.py 2>/dev/null; then
-  pass "Lift scoring implementation exists"
+# 5. All tests pass (also generates coverage.xml with mining.py)
+if timeout 60 .venv/bin/pytest tests/ --cov=src/cerebellum/mining --cov-report=term-missing -q 2>&1 | tail -1 | grep -q "passed"; then
+  pass "All tests pass"
 else
-  fail "No lift scoring in mining.py"
+  fail "Tests failed"
 fi
 
-# Check shuffle baselines
-if grep -q "compute_shuffle_baseline" src/cerebellum/mining.py 2>/dev/null; then
-  pass "Shuffle baseline implementation exists"
-else
-  fail "No shuffle baselines in mining.py"
-fi
-
-# Check entity-aware mining
-if grep -q "build_item_sequences" src/cerebellum/mining.py 2>/dev/null; then
-  pass "Entity-aware item sequence building exists"
-else
-  fail "No entity-aware mining in mining.py"
-fi
-
-# Check mine_successor_edges uses PrefixSpan
-if grep -q "mine_patterns" src/cerebellum/episode_store.py 2>/dev/null; then
-  pass "EpisodeStore uses PrefixSpan mining"
-else
-  fail "EpisodeStore not using PrefixSpan mining"
-fi
-
-# Check old heuristic removed
-if grep -q "_event_types_change_significantly" src/cerebellum/episode_store.py 2>/dev/null; then
-  fail "Old _event_types_change_significantly heuristic still present"
-else
-  pass "Old heuristic removed"
-fi
-
-# Check proposer surfaces patterns
-if grep -q "_get_relevant_patterns" src/cerebellum/proposer.py 2>/dev/null; then
-  pass "Proposer surfaces successor patterns"
-else
-  fail "Proposer not surfacing patterns"
-fi
-
-# Check mining tests exist
-if [ -f tests/test_mining.py ]; then
-  pass "Mining tests exist"
-else
-  fail "No mining tests found"
-fi
-
-# Check mining test coverage
-MINING_COVERAGE=$(.venv/bin/python3 -c "
+# 3. Coverage on mining.py >= 80% (after coverage.xml is fresh)
+MINING_COVER=$(.venv/bin/python3 -c "
 import xml.etree.ElementTree as ET
 tree = ET.parse('coverage.xml')
 for class_elem in tree.findall('.//class'):
@@ -84,25 +46,18 @@ for class_elem in tree.findall('.//class'):
         print(class_elem.get('line-rate', '0'))
         break
 ")
-COVERAGE_CHECK=$(python3 -c "print(1 if float('$MINING_COVERAGE') > 0.8 else 0)")
+COVERAGE_CHECK=$(python3 -c "print(1 if float('$MINING_COVER') >= 0.80 else 0)")
 if [ "$COVERAGE_CHECK" -eq 1 ]; then
-  pass "Mining coverage >= 80% (${MINING_COVERAGE})"
+  pass "mining.py coverage ${MINING_COVER} (>= 80%)"
 else
-  fail "Mining coverage < 80% (${MINING_COVERAGE})"
+  fail "mining.py coverage ${MINING_COVER} (need >= 80%)"
 fi
 
-# Check lift column in schema
-if grep -q "lift FLOAT" src/cerebellum/episode_store.py 2>/dev/null; then
-  pass "Lift column in SuccessorEdge schema"
+# 4. decisions.md records lift distribution
+if grep -q "Lift distribution" decisions.md 2>/dev/null; then
+  pass "Lift distribution recorded in decisions.md"
 else
-  fail "No lift column in schema"
-fi
-
-# Run tests
-if make test 2>&1 | tail -1 | grep -q "passed"; then
-  pass "All tests pass"
-else
-  fail "Tests failed"
+  warn "Lift distribution not yet recorded in decisions.md"
 fi
 
 echo ""
