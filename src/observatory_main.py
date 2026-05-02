@@ -2,10 +2,10 @@
 """Cerebellum Observatory — single event store, NATS subscriber, no dashboard subprocess."""
 import asyncio
 import importlib.util
+import json
 import logging
 import signal
 import sys
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +14,8 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 
 
 class ObservatoryService:
+    RELAY_ACTOR = "observatory.nats-subscriber"
+
     def __init__(self) -> None:
         self.stop_requested = False
         self._emitter: Any = None
@@ -103,15 +105,26 @@ class ObservatoryService:
                 LOGGER.exception("Emitter shutdown failed")
 
     def _relay_event(self, topic: str, data: str) -> None:
-        """Relay NATS events through the single emitter (→ events.db + JetStream)."""
+        """Relay NATS events through the single emitter (→ events.db + JetStream).
+
+        Drops events already emitted by the relay itself to prevent an
+        unbounded amplification loop (emit → NATS → handler → emit → ...).
+        """
         if self._emitter is None:
             return
         try:
+            try:
+                parsed = json.loads(data)
+            except Exception:
+                parsed = None
+            if isinstance(parsed, dict) and parsed.get("actor") == self.RELAY_ACTOR:
+                return
+
             event_type = topic.replace("cerebellum.events.", "", 1)
             self._emitter.emit(
                 event_type,
                 payload={"subject": topic, "data": data},
-                actor="observatory.nats-subscriber",
+                actor=self.RELAY_ACTOR,
             )
         except Exception:
             LOGGER.exception("Failed to relay NATS event %s through emitter", topic)

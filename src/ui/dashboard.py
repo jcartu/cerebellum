@@ -7,7 +7,7 @@ import logging
 import os
 import re
 from collections import Counter
-from datetime import UTC, datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -232,44 +232,89 @@ async def api_stats_html() -> str:
 # ---------------------------------------------------------------------------
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN") or os.environ.get("OPENCLAW_TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_WEBHOOK_SECRET = os.environ.get("TELEGRAM_WEBHOOK_SECRET", "")
+TELEGRAM_ALLOWED_USER_IDS = {
+    uid.strip()
+    for uid in os.environ.get("TELEGRAM_ALLOWED_USER_IDS", "").split(",")
+    if uid.strip()
+}
+HYPOTHESIS_ID_RE = re.compile(r"^[A-Za-z0-9_\-:]{1,128}$")
 
 
 @app.post("/telegram/webhook")
 async def telegram_webhook(request: Request) -> JSONResponse:
-    """Receive Telegram callback queries and commands."""
+    """Receive Telegram callback queries and commands.
+
+    Security:
+      - Requires TELEGRAM_WEBHOOK_SECRET to be set and match the
+        X-Telegram-Bot-Api-Secret-Token header (Telegram's built-in secret).
+      - User IDs must appear in TELEGRAM_ALLOWED_USER_IDS (comma-separated).
+      - hypothesis_id must match a strict allowlist regex.
+    """
     if not TELEGRAM_BOT_TOKEN:
         return JSONResponse({"ok": False, "error": "Telegram bot token not configured"}, status_code=503)
 
-    update = await request.json()
-    callback = update.get("callback_query", {})
-    message = update.get("message", {})
+    if not TELEGRAM_WEBHOOK_SECRET:
+        logger.error("TELEGRAM_WEBHOOK_SECRET not set; refusing webhook")
+        raise HTTPException(status_code=503, detail="Webhook secret not configured")
 
-    # Handle callback queries (approve/reject/snooze/explain buttons)
+    provided_secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+    if provided_secret != TELEGRAM_WEBHOOK_SECRET:
+        logger.warning("Rejected Telegram webhook: bad secret token")
+        raise HTTPException(status_code=401, detail="Invalid webhook secret")
+
+    if not TELEGRAM_ALLOWED_USER_IDS:
+        logger.error("TELEGRAM_ALLOWED_USER_IDS not set; refusing webhook")
+        raise HTTPException(status_code=503, detail="No allowed user ids configured")
+
+    try:
+        update = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    callback = update.get("callback_query") or {}
+    message = update.get("message") or {}
+
+    def _actor_id(obj: dict) -> str:
+        user = obj.get("from") or {}
+        return str(user.get("id") or "")
+
     if callback:
-        callback_data = callback.get("data", "")
-        callback_id = callback.get("id", "")
+        actor = _actor_id(callback)
+        if actor not in TELEGRAM_ALLOWED_USER_IDS:
+            logger.warning("Rejected callback from unauthorized user %s", actor)
+            raise HTTPException(status_code=403, detail="User not allowed")
 
-        # Parse callback data: "action:hypothesis_id"
+        callback_data = str(callback.get("data", ""))
+        callback_id = str(callback.get("id", ""))
+
         match = re.match(r"^(approve|reject|snooze|explain):(.+)$", callback_data)
         if match:
             action, hypothesis_id = match.groups()
+            if not HYPOTHESIS_ID_RE.match(hypothesis_id):
+                _answer_callback(callback_id, "Invalid hypothesis id")
+                raise HTTPException(status_code=400, detail="Invalid hypothesis id")
             arbiter = get_arbiter()
             if arbiter:
                 try:
-                    result = arbiter.handle_approval(hypothesis_id, action)
-                    # Answer callback query
+                    result = arbiter.handle_approval(hypothesis_id, action, user_id=actor)
                     _answer_callback(callback_id, "Processed")
                     return JSONResponse(result)
                 except Exception:
                     logger.exception("Failed to handle approval for %s", hypothesis_id)
                     _answer_callback(callback_id, "Error processing request")
-            else:
-                _answer_callback(callback_id, "Arbiter unavailable")
-        else:
-            _answer_callback(callback_id, "Unknown action")
+                    return JSONResponse({"ok": False, "error": "handler failed"}, status_code=500)
+            _answer_callback(callback_id, "Arbiter unavailable")
+            return JSONResponse({"ok": False, "error": "Arbiter unavailable"}, status_code=503)
 
-    # Handle /cerebellum-halt command
+        _answer_callback(callback_id, "Unknown action")
+        return JSONResponse({"ok": False, "error": "Unknown action"}, status_code=400)
+
     if message and message.get("text") == "/cerebellum-halt":
+        actor = _actor_id(message)
+        if actor not in TELEGRAM_ALLOWED_USER_IDS:
+            logger.warning("Rejected /cerebellum-halt from unauthorized user %s", actor)
+            raise HTTPException(status_code=403, detail="User not allowed")
         arbiter = get_arbiter()
         if arbiter:
             result = arbiter.toggle_kill_switch(enabled=True)
@@ -319,7 +364,8 @@ def _send_telegram_text(chat_id: str | int, text: str) -> None:
 def main() -> None:
     config = json.loads(CONFIG_PATH.read_text())
     port = config.get("dashboard", {}).get("port", 18790)
-    uvicorn.run(app, host="0.0.0.0", port=port, reload=False)
+    host = os.environ.get("CEREBELLUM_DASHBOARD_HOST", "127.0.0.1")
+    uvicorn.run(app, host=host, port=port, reload=False)
 
 
 if __name__ == "__main__":

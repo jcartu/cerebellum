@@ -39,6 +39,8 @@ class CerebellumEventEmitter:
         self._js: Any | None = None
         self._nats_ready = False
         self._subscription_futures: list[Future[Any]] = []
+        self._inflight_publishes: list[Future[Any]] = []
+        self._inflight_lock = threading.Lock()
 
         self._connect_to_nats()
 
@@ -63,7 +65,28 @@ class CerebellumEventEmitter:
 
         if self._nats_ready:
             try:
-                asyncio.run_coroutine_threadsafe(self._publish_event(event), self._loop)
+                fut = asyncio.run_coroutine_threadsafe(self._publish_event(event), self._loop)
+                with self._inflight_lock:
+                    self._inflight_publishes.append(fut)
+                    # Cap list size — drop refs to any already-completed futures.
+                    if len(self._inflight_publishes) > 256:
+                        self._inflight_publishes = [
+                            f for f in self._inflight_publishes if not f.done()
+                        ]
+
+                def _on_done(f: Future[Any], _eid: str = event_id) -> None:
+                    try:
+                        f.result()
+                    except Exception as exc:
+                        logger.error("NATS publish failed for event %s: %s", _eid, exc)
+                    finally:
+                        with self._inflight_lock:
+                            try:
+                                self._inflight_publishes.remove(f)
+                            except ValueError:
+                                pass
+
+                fut.add_done_callback(_on_done)
             except RuntimeError:
                 logger.debug("NATS loop unavailable, stored event %s in SQLite only", event_id)
         else:

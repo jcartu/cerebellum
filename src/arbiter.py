@@ -1,7 +1,6 @@
 import json
 import logging
 import os
-import sqlite3
 import subprocess
 import threading
 import time
@@ -42,7 +41,7 @@ class RateLimiter:
         self.max_count = max_count
         self.window_seconds = window_seconds
         self.events: list[float] = []
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
 
     def allow(self) -> bool:
         with self._lock:
@@ -113,7 +112,6 @@ class BasalGanglia:
         self.feedback_file = self.state_dir / "arbiter_feedback.jsonl"
         self.state_file = self.state_dir / "arbiter_state.json"
         self.decisions_file = self.state_dir / "arbiter_decisions.jsonl"
-        self.events_db_path = self.state_dir / "observatory.sqlite3"
         self.emitter = emitter
         self.cortex = cortex
         self._lock = threading.Lock()
@@ -135,11 +133,16 @@ class BasalGanglia:
     def evaluate(self, hypothesis: dict) -> ActionDecision:
         hypothesis_id = str(hypothesis.get("id") or hypothesis.get("hypothesis_id") or uuid.uuid4())
         confidence = float(hypothesis.get("confidence") or 0.0)
-        cost = float(hypothesis.get("estimated_cost") or hypothesis.get("cost") or 0.0)
+        # NOTE: `cost` here is the hypothesis-generation LLM token cost ONLY.
+        # It is NOT the cost of executing the plan. Execution cost is not
+        # currently modeled — see audit H8. The budget check below therefore
+        # only rate-limits hypothesis-generation spend, not tool-execution spend.
+        cost = float(hypothesis.get("cost") or 0.0)
         reversibility = str(hypothesis.get("reversibility") or "unknown")
         tools = self._extract_tools(hypothesis)
 
         try:
+            self._refresh_kill_switch_from_disk()
             if self.kill_switch:
                 return self._record_decision(hypothesis_id, "discard", "kill switch enabled")
 
@@ -204,7 +207,7 @@ class BasalGanglia:
         payload = {
             "hypothesis_id": hypothesis_id,
             "status": "completed" if success else "partial_failure",
-            "executed_at": datetime.utcnow().isoformat(),
+            "executed_at": datetime.now(timezone.utc).isoformat(),
             "results": results,
         }
         self._update_hypothesis_state(hypothesis_id, payload["status"], payload)
@@ -231,26 +234,28 @@ class BasalGanglia:
             "hypothesis_id": hypothesis_id,
             "message_id": message_id,
             "status": "pending",
-            "staged_at": datetime.utcnow().isoformat(),
-            "expires_at": (datetime.utcnow() + timedelta(minutes=timeout_minutes)).isoformat(),
+            "staged_at": datetime.now(timezone.utc).isoformat(),
+            "expires_at": (datetime.now(timezone.utc) + timedelta(minutes=timeout_minutes)).isoformat(),
             "hypothesis": hypothesis,
             "telegram_result": telegram_result,
         }
-        pending = self._load_json(self.pending_file, default={})
-        pending[hypothesis_id] = record
-        self._save_json(self.pending_file, pending)
+        with self._lock:
+            pending = self._load_json(self.pending_file, default={})
+            pending[hypothesis_id] = record
+            self._save_json(self.pending_file, pending)
         self._update_hypothesis_state(hypothesis_id, "pending_approval", record)
         self._emit_event("cerebellum.approval.staged", record)
         return message_id
 
     def handle_approval(self, hypothesis_id: str, decision: str, user_id: str = "") -> dict:
-        pending = self._load_json(self.pending_file, default={})
+        with self._lock:
+            pending = self._load_json(self.pending_file, default={})
         record = pending.get(hypothesis_id, {})
         response = {
             "hypothesis_id": hypothesis_id,
             "decision": decision,
             "user_id": user_id,
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
         }
         try:
             if decision == "approve":
@@ -263,9 +268,11 @@ class BasalGanglia:
                 self._update_hypothesis_state(hypothesis_id, "rejected", response)
             elif decision == "snooze":
                 response["status"] = "snoozed"
-                record["expires_at"] = (datetime.utcnow() + timedelta(hours=1)).isoformat()
-                pending[hypothesis_id] = record
-                self._save_json(self.pending_file, pending)
+                record["expires_at"] = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+                with self._lock:
+                    pending = self._load_json(self.pending_file, default={})
+                    pending[hypothesis_id] = record
+                    self._save_json(self.pending_file, pending)
                 self._update_hypothesis_state(hypothesis_id, "snoozed", response)
             elif decision == "explain":
                 response["status"] = "explained"
@@ -276,8 +283,10 @@ class BasalGanglia:
                 response["status"] = "unknown_decision"
 
             if decision in {"approve", "reject"}:
-                pending.pop(hypothesis_id, None)
-                self._save_json(self.pending_file, pending)
+                with self._lock:
+                    pending = self._load_json(self.pending_file, default={})
+                    pending.pop(hypothesis_id, None)
+                    self._save_json(self.pending_file, pending)
 
             self._emit_event("cerebellum.approval", response)
             return response
@@ -292,11 +301,110 @@ class BasalGanglia:
         self._persist_state()
         payload = {
             "kill_switch": self.kill_switch,
-            "updated_at": datetime.utcnow().isoformat(),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
             "command": self.kill_switch_command,
         }
         self._emit_event("cerebellum.kill_switch", payload)
         return payload
+
+    def _refresh_kill_switch_from_disk(self) -> None:
+        """Re-read kill-switch state from the shared state file.
+
+        Enables cross-process halt: when the dashboard toggles the switch,
+        the arbiter_loop process observes it on the next evaluate() cycle.
+        """
+        try:
+            state = self._load_json(self.state_file, default={})
+            disk_value = state.get("kill_switch")
+            if isinstance(disk_value, bool):
+                self.kill_switch = disk_value
+        except Exception:
+            logger.exception("Failed to refresh kill switch from %s", self.state_file)
+
+    def _validate_url(self, url: str) -> None:
+        """SSRF guard: only allow http/https to public hosts."""
+        import ipaddress
+        import socket
+
+        if not isinstance(url, str) or not url.strip():
+            raise ValueError("URL must be a non-empty string")
+
+        parsed = urllib.parse.urlparse(url.strip())
+        if parsed.scheme not in ("http", "https"):
+            raise ValueError(f"URL scheme must be http or https, got: {parsed.scheme}")
+
+        hostname = parsed.hostname
+        if not hostname:
+            raise ValueError("URL is missing a hostname")
+
+        forbidden_hosts = {"localhost", "metadata.google.internal", "metadata"}
+        if hostname.lower() in forbidden_hosts:
+            raise ValueError(f"Forbidden hostname: {hostname}")
+
+        try:
+            infos = socket.getaddrinfo(hostname, None)
+        except socket.gaierror as exc:
+            raise ValueError(f"Cannot resolve hostname {hostname}: {exc}") from exc
+
+        for info in infos:
+            addr = info[4][0]
+            try:
+                ip = ipaddress.ip_address(addr)
+            except ValueError:
+                continue
+            if (
+                ip.is_private
+                or ip.is_loopback
+                or ip.is_link_local
+                or ip.is_multicast
+                or ip.is_reserved
+                or ip.is_unspecified
+            ):
+                raise ValueError(f"URL resolves to forbidden address {addr} (host={hostname})")
+
+    def _validate_file_path(self, path: Path) -> None:
+        """Restrict file.read to allowlisted roots; reject traversal & secrets."""
+        if not isinstance(path, Path):
+            raise ValueError("file path must be a Path instance")
+
+        try:
+            resolved = path.expanduser().resolve(strict=False)
+        except Exception as exc:
+            raise ValueError(f"Unable to resolve path {path}: {exc}") from exc
+
+        resolved_str = str(resolved)
+
+        forbidden_patterns = (
+            "/etc/shadow",
+            "/etc/passwd",
+            "/etc/sudoers",
+            "/.ssh/",
+            "/.aws/",
+            "/.gnupg/",
+            "/root/",
+            "/proc/",
+            "/sys/",
+        )
+        for pattern in forbidden_patterns:
+            if pattern in resolved_str:
+                raise ValueError(f"Forbidden path pattern {pattern!r} in {resolved_str}")
+
+        if ".env" in resolved.name:
+            raise ValueError(f"Refusing to read env file: {resolved_str}")
+
+        allowed_roots = [
+            self.base_dir.resolve(),
+            Path("/tmp").resolve(),
+            Path("/var/tmp").resolve(),
+        ]
+        for root in allowed_roots:
+            try:
+                resolved.relative_to(root)
+                return
+            except ValueError:
+                continue
+
+        raise ValueError(f"Path {resolved_str} is outside allowed roots")
 
     def get_status(self) -> dict:
         pending = self._load_json(self.pending_file, default={})
@@ -316,7 +424,7 @@ class BasalGanglia:
             hypothesis_id=hypothesis_id,
             decision=decision,
             reason=reason,
-            timestamp=datetime.utcnow().isoformat(),
+            timestamp=datetime.now(timezone.utc).isoformat(),
         )
         payload = action_decision.to_dict()
         self.recent_decisions.append(payload)
@@ -404,8 +512,12 @@ class BasalGanglia:
                 "User-Agent": "Cerebellum/1.0",
             },
         )
+        MAX_RESPONSE_BYTES = 2 * 1024 * 1024  # 2 MiB
         with urllib.request.urlopen(request, timeout=30) as response:
-            payload = json.loads(response.read().decode("utf-8"))
+            raw = response.read(MAX_RESPONSE_BYTES + 1)
+        if len(raw) > MAX_RESPONSE_BYTES:
+            raise RuntimeError("web.search response exceeded 2 MiB cap")
+        payload = json.loads(raw.decode("utf-8"))
         return {"status": "ok", "tool": "web.search", "query": query, "results": payload}
 
     def _handle_file_read(self, step: dict[str, Any]) -> dict[str, Any]:
@@ -434,8 +546,12 @@ class BasalGanglia:
             data=payload,
             headers={"Content-Type": "application/json"},
         )
+        MAX_RESPONSE_BYTES = 4 * 1024 * 1024
         with urllib.request.urlopen(request, timeout=30) as response:
-            result = json.loads(response.read().decode("utf-8"))
+            raw = response.read(MAX_RESPONSE_BYTES + 1)
+        if len(raw) > MAX_RESPONSE_BYTES:
+            raise RuntimeError("memory.query response exceeded 4 MiB cap")
+        result = json.loads(raw.decode("utf-8"))
         return {"status": "ok", "tool": "memory.query", "result": result}
 
     def _handle_model_call(self, step: dict[str, Any]) -> dict[str, Any]:
@@ -457,8 +573,12 @@ class BasalGanglia:
                 "X-Title": "CEREBELLUM",
             },
         )
+        MAX_RESPONSE_BYTES = 8 * 1024 * 1024
         with urllib.request.urlopen(request, timeout=60) as response:
-            result = json.loads(response.read().decode("utf-8"))
+            raw = response.read(MAX_RESPONSE_BYTES + 1)
+        if len(raw) > MAX_RESPONSE_BYTES:
+            raise RuntimeError("model.call response exceeded 8 MiB cap")
+        result = json.loads(raw.decode("utf-8"))
         return {"status": "ok", "tool": "model.call", "result": result}
 
     def _handle_notification_send(self, step: dict[str, Any]) -> dict[str, Any]:
@@ -533,10 +653,7 @@ class BasalGanglia:
     def _update_hypothesis_state(self, hypothesis_id: str, state: str, payload: dict[str, Any]) -> None:
         if self.cortex is not None:
             for method_name in ("update_hypothesis_state", "set_hypothesis_state"):
-                try:
-                    method = getattr(self.cortex, method_name, None)
-                except TypeError:
-                    continue
+                method = getattr(self.cortex, method_name, None)
                 if callable(method):
                     try:
                         method(hypothesis_id, state, payload)
@@ -550,7 +667,7 @@ class BasalGanglia:
         state_data = self._load_json(self.state_dir / "hypothesis_states.json", default={})
         state_data[hypothesis_id] = {
             "state": state,
-            "updated_at": datetime.utcnow().isoformat(),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
             "payload": payload,
         }
         self._save_json(self.state_dir / "hypothesis_states.json", state_data)
@@ -558,10 +675,7 @@ class BasalGanglia:
     def _emit_event(self, topic: str, payload: dict[str, Any]) -> None:
         if self.emitter is not None:
             for method_name in ("emit", "publish", "send"):
-                try:
-                    method = getattr(self.emitter, method_name, None)
-                except TypeError:
-                    continue
+                method = getattr(self.emitter, method_name, None)
                 if callable(method):
                     try:
                         method(topic, payload)
@@ -575,23 +689,19 @@ class BasalGanglia:
         self._persist_event(topic, payload)
 
     def _persist_event(self, topic: str, payload: dict[str, Any]) -> None:
+        """Fallback event persistence: append to JSONL in state_dir.
+
+        The canonical event store is events.db via CerebellumEventEmitter.
+        This fallback is used only when no emitter is wired.
+        """
+        fallback_path = self.state_dir / "arbiter_fallback_events.jsonl"
+        record = {
+            "topic": topic,
+            "payload": payload,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
         try:
-            with sqlite3.connect(self.events_db_path) as connection:
-                connection.execute(
-                    """
-                    CREATE TABLE IF NOT EXISTS events (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        topic TEXT NOT NULL,
-                        payload TEXT NOT NULL,
-                        created_at TEXT NOT NULL
-                    )
-                    """
-                )
-                connection.execute(
-                    "INSERT INTO events(topic, payload, created_at) VALUES (?, ?, ?)",
-                    (topic, json.dumps(payload), datetime.utcnow().isoformat()),
-                )
-                connection.commit()
+            self._append_jsonl(fallback_path, record)
         except Exception:
             logger.exception("Failed to persist fallback event %s", topic)
 
