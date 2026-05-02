@@ -1,44 +1,23 @@
 #!/usr/bin/env bash
-# Phase 6: Production Hardening — Exit Gate
-# Verifies: systemd services, monitoring, backup, disaster recovery
+# Phase 6: Test, harden, ship — Exit Gate (TODO: implement)
+# Per plan section 6.B:
+# - Coverage >= 80% across all modules; arbiter and dashboard >= 75%
+# - Property tests green with --hypothesis-seed from CI logs reproducing
+# - Fuzzer green
+# - make lint typecheck test clean on Python 3.11 and 3.12
+# - README accurately describes what ships, no claims unbacked by tests
+# - Fresh clone + pip install + 4 env vars + make run-* works
 set -euo pipefail
 
-RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
-PASS=0; FAIL=0; WARN=0
-
-pass() { echo -e "  ${GREEN}PASS${NC} $1"; PASS=$((PASS + 1)); }
-fail() { echo -e "  ${RED}FAIL${NC} $1"; FAIL=$((FAIL + 1)); }
-warn() { echo -e "  ${YELLOW}WARN${NC} $1"; WARN=$((WARN + 1)); }
-
-echo "=== Phase 6 Exit Gate: Production Hardening ==="
-
-# Check systemd service templates
-if [ -f "services/cerebellum-observatory.service.template" ]; then
-  pass "Observatory service template exists"
-else
-  fail "Missing observatory service template"
-fi
-
-if [ -f "services/cerebellum-cortex.service.template" ]; then
-  pass "Cortex service template exists"
-else
-  fail "Missing cortex service template"
-fi
-
-# Check install script
-if [ -f "scripts/install_systemd.sh" ]; then
-  pass "Systemd install script exists"
-else
-  fail "Missing systemd install script"
-fi
-
-# Run tests
-if make test 2>&1 | tail -1 | grep -q "passed"; then
-  pass "All tests pass"
-else
-  fail "Tests failed"
-fi
-
+echo "=== Phase 6 Exit Gate: Test, Harden, Ship ==="
 echo ""
-echo "Results: $PASS passed, $FAIL failed, $WARN warnings"
-[ "$FAIL" -eq 0 ] && exit 0 || exit 1
+echo "TODO: implement phase 6 gate checks"
+echo "  - [ ] Global coverage >= 80%, arbiter/dashboard >= 75%"
+echo "  - [ ] Property tests (Hypothesis) green"
+echo "  - [ ] Fuzzer green"
+echo "  - [ ] lint/typecheck/test on Python 3.11 and 3.12"
+echo "  - [ ] README accuracy audit"
+echo "  - [ ] Fresh clone smoke test"
+echo ""
+echo "Exiting with failure until implemented."
+exit 1
