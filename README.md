@@ -1,3 +1,11 @@
+<div align="center">
+
+![CEREBELLUM](logo.png)
+
+</div>
+
+---
+
 # 🧠 CEREBELLUM
 
 **A shadow cognition layer that watches your AI agent, learns its patterns, and proposes the next best action.**
