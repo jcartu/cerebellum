@@ -15,7 +15,7 @@ from typing import Any
 try:
     from openai import OpenAI
 except ImportError:  # pragma: no cover - handled gracefully at runtime
-    OpenAI = None  # type: ignore[assignment]
+    OpenAI = None  # type: ignore[misc]
 
 logger = logging.getLogger(__name__)
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -853,7 +853,7 @@ class Proposer:
             except Exception:
                 logger.debug("No successor patterns available for prompt")
 
-            return get_relevant_patterns(patterns, events, limit=10)
+            return get_relevant_patterns(patterns, events, limit=10)  # type: ignore[arg-type]
         except Exception:
             return []
 

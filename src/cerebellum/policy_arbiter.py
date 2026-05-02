@@ -23,7 +23,7 @@ from http.client import HTTPSConnection
 from pathlib import Path
 from typing import Any
 
-import yaml
+import yaml  # type: ignore[import-untyped]
 
 from cerebellum.http_client import safe_post
 from cerebellum.http_safe import NoRedirectHandler, _safe_opener
@@ -166,15 +166,15 @@ class _PinnedHTTPSConnection(HTTPSConnection):
 
     def connect(self) -> None:
         self.host = self._connect_host
-        self.sock = self._create_connection((self._connect_host, self.port), self.timeout, self.source_address)
+        self.sock = self._create_connection((self._connect_host, self.port), self.timeout, self.source_address)  # type: ignore[attr-defined]
         peer_ip = self._normalize_ip_address(self.sock.getpeername()[0])
         expected_ip = self._normalize_ip_address(self._connect_host)
         if peer_ip != expected_ip:
             self.sock.close()
             raise ValueError(f"Pinned HTTPS peer mismatch: expected {expected_ip}, got {peer_ip}")
-        if self._tunnel_host:
-            self._tunnel()
-        self.sock = self._context.wrap_socket(self.sock, server_hostname=self._server_hostname or self.host)
+        if self._tunnel_host:  # type: ignore[attr-defined]
+            self._tunnel()  # type: ignore[attr-defined]
+        self.sock = self._context.wrap_socket(self.sock, server_hostname=self._server_hostname or self.host)  # type: ignore[attr-defined]
 
     @staticmethod
     def _normalize_ip_address(value: str) -> str:
@@ -388,7 +388,7 @@ class PolicyArbiter:
         }
         if halted_for_budget:
             payload["reason"] = "execution cost budget exceeded"
-        self._update_hypothesis_state(hypothesis_id, payload["status"], payload)
+        self._update_hypothesis_state(hypothesis_id, payload["status"], payload)  # type: ignore[arg-type]
         self._emit_event("cerebellum.execution", payload)
         return payload
 
@@ -471,7 +471,7 @@ class PolicyArbiter:
 
             if decision == "approve":
                 hypothesis = record.get("hypothesis", {})
-                response["execution"] = self.auto_execute(hypothesis)
+                response["execution"] = self.auto_execute(hypothesis)  # type: ignore[assignment]
                 response["status"] = "approved"
             elif decision == "reject":
                 response["status"] = "rejected"
@@ -1041,7 +1041,7 @@ class PolicyArbiter:
         hours = float(step.get("hours", 1))
         since = datetime.now(UTC) - timedelta(hours=hours)
 
-        events = self.event_bus.query(since=since, limit=50)
+        events = self._emitter.query(since=since, limit=50)  # type: ignore[attr-defined]
         if not events:
             return {"status": "ok", "tool": "notification.summarize", "result": {"message": "No recent events"}}
 

@@ -415,7 +415,7 @@ class GroundingVerifier:
             ).fetchone()
             conn.close()
             if row and row[0] and row[0] > 0:
-                return round(row[1] / row[0], 4)
+                return round(float(row[1]) / float(row[0]), 4)
         except Exception as exc:
             logger.warning("Failed to get disagreement rate: %s", exc)
         return 0.0

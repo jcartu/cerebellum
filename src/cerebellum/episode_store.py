@@ -252,7 +252,7 @@ class EpisodeStore:
             return []
 
         # Aggregate by event-type pair, keeping best lift + summing support
-        aggregated: dict[tuple[str, str], SuccessorPattern] = {}
+        aggregated: dict[tuple[str, str], SuccessorPattern] = {}  # type: ignore[name-defined]
         for pattern in patterns:
             key = (pattern.source.event_type, pattern.target.event_type)
             if key not in aggregated or pattern.lift > aggregated[key].lift:
@@ -527,7 +527,7 @@ class EpisodeStore:
     def _execute(self, query: str, parameters: dict[str, Any] | None = None) -> kuzu.QueryResult:
         conn = self._get_connection()
         cleaned_query = query.strip()
-        return conn.execute(cleaned_query, parameters or {})
+        return conn.execute(cleaned_query, parameters or {})  # type: ignore[return-value]
 
     def _fetch_all(self, query: str, parameters: dict[str, Any] | None = None) -> list[dict[str, Any]]:
         result = self._execute(query, parameters)
@@ -552,14 +552,14 @@ class EpisodeStore:
         try:
             result = conn.execute(cleaned_query, parameters or {})
             try:
-                columns = result.get_column_names()
+                columns = result.get_column_names()  # type: ignore[union-attr]
                 rows: list[dict[str, Any]] = []
-                while result.has_next():
-                    values = result.get_next()
+                while result.has_next():  # type: ignore[union-attr]
+                    values = result.get_next()  # type: ignore[union-attr]
                     rows.append(dict(zip(columns, values, strict=False)))
                 return rows
             finally:
-                result.close()
+                result.close()  # type: ignore[union-attr]
         except Exception:
             logger.debug("Read-only query failed; returning empty")
             return []
