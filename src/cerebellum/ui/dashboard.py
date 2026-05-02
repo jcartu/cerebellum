@@ -23,6 +23,7 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
 from cerebellum.event_bus import EventBus
+from cerebellum.feedback_loop import FeedbackStore
 from cerebellum.http_safe import _safe_opener
 from cerebellum.policy_arbiter import PolicyArbiter
 
@@ -84,6 +85,17 @@ _auth_rate_lock = threading.RLock()
 _auth_rate_windows: dict[str, tuple[int, int]] = {}
 _telegram_webhook_rate_lock = threading.RLock()
 _telegram_webhook_rate_windows: dict[str, tuple[int, int]] = {}
+
+
+_feedback_store: FeedbackStore | None = None
+
+
+def get_feedback_store() -> FeedbackStore:
+    global _feedback_store
+    if _feedback_store is None:
+        db_path = _base_dir() / "feedback.db"
+        _feedback_store = FeedbackStore(db_path)
+    return _feedback_store
 
 
 def _dashboard_db_path() -> Path:
@@ -374,6 +386,117 @@ async def api_stats_html() -> str:
     <ul style=\"list-style:none;padding:0;margin:0;display:grid;gap:10px\">{count_rows}</ul>
     <style>li{{display:flex;justify-content:space-between;gap:12px;border-bottom:1px solid #16263f;padding-bottom:8px}}li:last-child{{border-bottom:none}}</style>
     """
+
+
+@app.get("/metrics", response_class=HTMLResponse)
+async def metrics_page() -> str:
+    store = get_feedback_store()
+    metrics = store.compute_calibration(window_days=7)
+    outcomes = store.query_outcomes(limit=100)
+
+    outcome_rows = ""
+    for row in outcomes[:20]:
+        outcome_rows += f"""
+        <tr>
+          <td>{html.escape(row['hypothesis_id'][:32])}</td>
+          <td>{html.escape(row['model'])}</td>
+          <td>{row['confidence']:.3f}</td>
+          <td>{html.escape(row['outcome'])}</td>
+          <td>{html.escape(row['outcome_at'][:16])}</td>
+        </tr>"""
+
+    return f"""
+    <!DOCTYPE html>
+    <html lang="en">
+      <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <title>CEREBELLUM · Metrics</title>
+        <style>
+          :root {{ color-scheme: dark; }}
+          body {{ margin: 0; font-family: Inter, ui-sans-serif, system-ui, sans-serif; background: #070b12; color: #d9e7ff; }}
+          main {{ max-width: 1080px; margin: 0 auto; padding: 24px; }}
+          h1 {{ margin-bottom: 4px; font-size: 28px; }}
+          .subtle {{ color: #87a1c3; margin-bottom: 24px; }}
+          .panel {{ background: rgba(10, 18, 31, 0.9); border: 1px solid #1b2c48; border-radius: 16px; padding: 16px; margin-bottom: 16px; }}
+          .metric-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; }}
+          .metric-card {{ background: #0b1322; border: 1px solid #1b2c48; border-radius: 12px; padding: 12px; }}
+          .metric-label {{ color: #87a1c3; font-size: 13px; margin-bottom: 4px; }}
+          .metric-value {{ font-size: 24px; font-weight: 700; color: #7cd4ff; }}
+          table {{ width: 100%; border-collapse: collapse; font-size: 13px; }}
+          th {{ text-align: left; color: #87a1c3; padding: 8px; border-bottom: 1px solid #1b2c48; }}
+          td {{ padding: 8px; border-bottom: 1px solid #0d1a2d; }}
+          .calibrated {{ color: #4ade80; }}
+          .uncalibrated {{ color: #f87171; }}
+          a {{ color: #7cd4ff; }}
+        </style>
+      </head>
+      <body>
+        <main>
+          <h1>CEREBELLUM Metrics</h1>
+          <div class="subtle">Feedback loop · calibration · <a href="/">← Back to dashboard</a></div>
+          <div class="panel">
+            <h2 style="margin-top:0">Calibration ({metrics.window_days}d window)</h2>
+            <div class="metric-grid">
+              <div class="metric-card">
+                <div class="metric-label">Model</div>
+                <div class="metric-value">{html.escape(metrics.model)}</div>
+              </div>
+              <div class="metric-card">
+                <div class="metric-label">Total Outcomes</div>
+                <div class="metric-value">{metrics.total_outcomes}</div>
+              </div>
+              <div class="metric-card">
+                <div class="metric-label">Approval Rate</div>
+                <div class="metric-value">{metrics.approval_rate:.1%}</div>
+              </div>
+              <div class="metric-card">
+                <div class="metric-label">Mean Confidence (Approved)</div>
+                <div class="metric-value">{metrics.mean_confidence_approved:.3f}</div>
+              </div>
+              <div class="metric-card">
+                <div class="metric-label">Mean Confidence (Rejected)</div>
+                <div class="metric-value">{metrics.mean_confidence_rejected:.3f}</div>
+              </div>
+              <div class="metric-card">
+                <div class="metric-label">Expected Calibration Error</div>
+                <div class="metric-value">{metrics.expected_calibration_error:.4f}</div>
+              </div>
+              <div class="metric-card">
+                <div class="metric-label">Status</div>
+                <div class="metric-value {'calibrated' if metrics.is_calibrated else 'uncalibrated'}">{'Calibrated' if metrics.is_calibrated else 'Uncalibrated'}</div>
+              </div>
+            </div>
+          </div>
+          <div class="panel">
+            <h2 style="margin-top:0">Recent Outcomes</h2>
+            <table>
+              <thead><tr><th>Hypothesis ID</th><th>Model</th><th>Confidence</th><th>Outcome</th><th>Time</th></tr></thead>
+              <tbody>{outcome_rows}</tbody>
+            </table>
+          </div>
+        </main>
+      </body>
+    </html>
+    """
+
+
+@app.get("/api/metrics")
+async def api_metrics() -> JSONResponse:
+    store = get_feedback_store()
+    metrics = store.compute_calibration(window_days=7)
+    return JSONResponse({
+        "model": metrics.model,
+        "window_days": metrics.window_days,
+        "total_outcomes": metrics.total_outcomes,
+        "approval_rate": metrics.approval_rate,
+        "mean_confidence_approved": metrics.mean_confidence_approved,
+        "mean_confidence_rejected": metrics.mean_confidence_rejected,
+        "expected_calibration_error": metrics.expected_calibration_error,
+        "is_calibrated": metrics.is_calibrated,
+        "platt_a": metrics.platt_a,
+        "platt_b": metrics.platt_b,
+    })
 
 
 # ---------------------------------------------------------------------------
