@@ -45,30 +45,53 @@ For each phase, fill out the section before merging to `main` and tagging `phase
 
 ## Phase 0 — Bootstrap
 
-- **Started:**
-- **Completed:**
+- **Started:** 2026-05-02
+- **Completed:** 2026-05-02
 - **Branch:** phase-0-bootstrap
-- **Commit range:**
-- **Exit gate result:**
+- **Commit range:** 3da5741..672ae0a
+- **Exit gate result:** PASS (lint clean, tests pass, 12.66% coverage, mypy deferred to Phase 6)
 
 ### What shipped
+- Package layout: `src/*.py` → `src/cerebellum/*.py` (proper hatchling package)
+- `pyproject.toml` with deps, dev deps, ruff/mypy/pytest config
+- `Makefile` with install/test/lint/typecheck/format/run targets
+- `requirements.txt` generated via pip-compile
+- GitHub Actions CI (ruff + mypy + pytest on Python 3.11/3.12)
+- `.gitignore`, `.env.example`, `config.example.json`
+- Phase exit gates: `scripts/gates/phase_0.sh` through `phase_6.sh`
+- `scripts/check_coverage_delta.py` for coverage regression detection
+- systemd service templates + `scripts/install_systemd.sh`
+- `src/cerebellum/models.py` — single source of truth for model identifiers
+- All imports updated to `cerebellum.*` namespace
+- Hardcoded `/home/josh` paths fixed in `cron/*.json`, scripts, source
+- Legacy files deleted: `cerebellum-plan.md`, root `__init__.py`, duplicate `cerebellum/` dir, old `.service` files
 
 ### What was deferred
+- Mypy strict type checking (70 errors) → Phase 6 per plan
+- Test coverage beyond 10% threshold → Phase 1+ (behavioral tests)
 
 ### Surprises
+- Python 3.14 available (system default), pyproject.toml targets 3.11+
+- `ruff --fix` removed some imports that were actually needed (F821 errors)
+- `pyproject.toml` got corrupted by repeated edits — had to rebuild manually
+- Gate script self-referenced `/home/josh` in grep — needed exclusion
 
 ### Decisions made without Opus
+- Chose hatchling over setuptools (simpler, faster, modern)
+- Coverage threshold 10% for Phase 0 (plan says "even if low")
+- Mypy deferred to Phase 6 (plan explicitly allows this)
+- `BASE_DIR` pattern using `Path(__file__).resolve().parent` instead of env var in scripts
 
 ### Opus calls
-
 | # | Date | Question | Response summary | Action taken |
 |---|------|----------|------------------|--------------|
+| 0 | — | — | No Opus calls this phase | — |
 
 ### Metrics snapshot
-- LOC delta:
-- Test count: before / after
-- Coverage: before / after
-- Opus token spend this phase: $
+- LOC delta: ~0 (restructure only, no new functionality)
+- Test count: 1 (smoke test) → 1 (same)
+- Coverage: 0% → 12.66%
+- Opus token spend this phase: $0
 
 ---
 
