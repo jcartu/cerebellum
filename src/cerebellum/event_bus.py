@@ -196,7 +196,7 @@ class EventBus:
 
     def _load_config(self, config_path: Path) -> dict[str, Any]:
         try:
-            return json.loads(config_path.read_text())
+            return json.loads(config_path.read_text())  # type: ignore[no-any-return]
         except FileNotFoundError:
             logger.error("Config file not found: %s", config_path)
             raise
@@ -263,7 +263,11 @@ class EventBus:
 
     async def _connect_to_nats_async(self) -> None:
         nats_config = self.config.get("nats", {})
-        servers = [f"nats://{nats_config.get('host', 'localhost')}:{nats_config.get('port', 4222)}"]
+        host = nats_config.get("host", "localhost")
+        port = nats_config.get("port", 4222)
+        tls_enabled = bool(nats_config.get("tls", False))
+        scheme = "tls" if tls_enabled else "nats"
+        servers = [f"{scheme}://{host}:{port}"]
         auth_token = os.environ.get("CEREBELLUM_NATS_TOKEN", "").strip()
         if not auth_token:
             raise RuntimeError(
@@ -274,12 +278,27 @@ class EventBus:
         for attempt in range(3):
             try:
                 self._nc = NATS()
-                await self._nc.connect(
-                    servers=servers,
-                    connect_timeout=10,
-                    max_reconnect_attempts=5,
-                    token=auth_token,
-                )
+                connect_kwargs: dict[str, Any] = {
+                    "servers": servers,
+                    "connect_timeout": 10,
+                    "max_reconnect_attempts": 5,
+                    "token": auth_token,
+                }
+                if tls_enabled:
+                    import ssl
+                    tls_context = ssl.create_default_context()
+                    tls_ca_path = nats_config.get("tls_ca") or os.environ.get("CEREBELLUM_NATS_TLS_CA")
+                    tls_cert_path = nats_config.get("tls_cert") or os.environ.get("CEREBELLUM_NATS_TLS_CERT")
+                    tls_key_path = nats_config.get("tls_key") or os.environ.get("CEREBELLUM_NATS_TLS_KEY")
+                    if tls_ca_path:
+                        tls_context.load_verify_locations(tls_ca_path)
+                    if tls_cert_path and tls_key_path:
+                        tls_context.load_cert_chain(tls_cert_path, tls_key_path)
+                        logger.info("Connecting to NATS with TLS (client cert auth)")
+                    else:
+                        logger.info("Connecting to NATS with TLS (server verification only)")
+                    connect_kwargs["tls"] = tls_context
+                await self._nc.connect(**connect_kwargs)
                 self._js = self._nc.jetstream(domain=nats_config.get("jetstream_domain") or None)
                 try:
                     await self._js.stream_info("CEREBELLUM_EVENTS")
@@ -291,7 +310,7 @@ class EventBus:
                     )
                 self._nats_ready = True
                 logger.info(
-                    "Connected to NATS JetStream at %s (attempt %d)", servers[0], attempt + 1
+                    "Connected to NATS JetStream at %s (attempt %d, tls=%s)", servers[0], attempt + 1, tls_enabled
                 )
                 return
             except Exception as exc:

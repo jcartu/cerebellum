@@ -57,6 +57,12 @@ class EpisodeStore:
         "UPSERT",
     )
 
+    _ALLOWED_CALL_PROCEDURES = frozenset({
+        "db.schema",
+        "db.show_tables",
+        "db.show_connections",
+    })
+
     def __init__(self, config_path: str):
         self.config_path = Path(config_path).expanduser()
         self.config = self._load_config(self.config_path)
@@ -438,7 +444,7 @@ class EpisodeStore:
     @staticmethod
     def _load_config(config_path: Path) -> dict[str, Any]:
         try:
-            return json.loads(config_path.read_text())
+            return json.loads(config_path.read_text())  # type: ignore[no-any-return]
         except FileNotFoundError:
             logger.warning("Config file %s not found; using defaults", config_path)
             return {}
@@ -533,8 +539,6 @@ class EpisodeStore:
         result = self._execute(query, parameters)
         try:
             columns = result.get_column_names()
-            if columns is None:
-                return []
             rows: list[dict[str, Any]] = []
             while result.has_next():
                 values = result.get_next()
@@ -765,7 +769,7 @@ User request: {natural_language}
     def _extract_json_object(self, text: str) -> dict[str, Any]:
         """Extract a JSON object from a text string."""
         try:
-            return json.loads(text)
+            return json.loads(text)  # type: ignore[no-any-return]
         except json.JSONDecodeError:
             pass
 
@@ -773,7 +777,7 @@ User request: {natural_language}
         end = text.rfind("}")
         if start != -1 and end != -1:
             try:
-                return json.loads(text[start : end + 1])
+                return json.loads(text[start : end + 1])  # type: ignore[no-any-return]
             except json.JSONDecodeError:
                 pass
 
@@ -786,12 +790,25 @@ User request: {natural_language}
         if ";" in candidate:
             return False
 
+        # Strip string literals so keywords inside string values don't trigger false positives
+        stripped = re.sub(r"'[^']*'", "''", candidate)
+        stripped = re.sub(r'"[^"]*"', '""', stripped)
+
         for keyword in self._READ_ONLY_BLOCKED_KEYWORDS:
-            if re.search(r"\b" + keyword + r"\b", candidate, re.IGNORECASE):
+            if re.search(r"\b" + keyword + r"\b", stripped, re.IGNORECASE):
                 return False
 
         first_word = candidate.split()[0].upper() if candidate.split() else ""
-        return first_word in self._READ_ONLY_QUERY_PREFIXES
+        if first_word not in self._READ_ONLY_QUERY_PREFIXES:
+            return False
+
+        # CALL whitelist: restrict to known-safe procedures
+        if first_word == "CALL" and len(candidate.split()) >= 2:
+            proc = candidate.split()[1].strip("()")
+            if proc not in self._ALLOWED_CALL_PROCEDURES:
+                return False
+
+        return True
 
     def _strip_query_comments(self, query: str) -> str:
         without_block_comments = re.sub(r"/\*.*?\*/", "", query, flags=re.DOTALL)

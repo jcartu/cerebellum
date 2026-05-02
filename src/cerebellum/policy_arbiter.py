@@ -79,7 +79,7 @@ class ActionDecision:
     reason: str
     timestamp: str
 
-    def to_dict(self) -> dict:
+    def to_dict(self) -> dict[str, Any]:
         return {
             "hypothesis_id": self.hypothesis_id,
             "decision": self.decision,
@@ -232,7 +232,7 @@ class PolicyArbiter:
         self.recent_decisions: list[ActionDecision] = []
         self._load_state()
 
-    def evaluate(self, hypothesis: dict) -> ActionDecision:
+    def evaluate(self, hypothesis: dict[str, Any]) -> ActionDecision:
         hypothesis_id = str(hypothesis.get("id") or hypothesis.get("hypothesis_id") or uuid.uuid4())
         daily_budget = float(self.cost_limiter.max_cost)
         raw_confidence = hypothesis.get("confidence")
@@ -337,7 +337,7 @@ class PolicyArbiter:
             logger.exception("Failed to evaluate hypothesis %s", hypothesis_id)
             return self._record_decision(hypothesis_id, "discard", f"evaluation error: {exc}")
 
-    def auto_execute(self, hypothesis: dict) -> dict:
+    def auto_execute(self, hypothesis: dict[str, Any]) -> dict[str, Any]:
         hypothesis_id = str(hypothesis.get("id") or hypothesis.get("hypothesis_id") or uuid.uuid4())
         self._refresh_kill_switch_from_disk()
         if self.kill_switch:
@@ -392,7 +392,7 @@ class PolicyArbiter:
         self._emit_event("cerebellum.execution", payload)
         return payload
 
-    def stage_for_approval(self, hypothesis: dict) -> str:
+    def stage_for_approval(self, hypothesis: dict[str, Any]) -> str:
         hypothesis_id = str(hypothesis.get("id") or hypothesis.get("hypothesis_id") or uuid.uuid4())
         sanitized_hypothesis = self._sanitize_hypothesis(hypothesis)
         timeout_minutes = int(
@@ -433,7 +433,7 @@ class PolicyArbiter:
         self._emit_event("cerebellum.approval.staged", record)
         return message_id
 
-    def handle_approval(self, hypothesis_id: str, decision: str, user_id: str = "") -> dict:
+    def handle_approval(self, hypothesis_id: str, decision: str, user_id: str = "") -> dict[str, Any]:
         import fcntl
 
         lock_path = self.pending_file.with_suffix(".json.lock")
@@ -496,7 +496,7 @@ class PolicyArbiter:
             response["error"] = str(exc)
             return response
 
-    def toggle_kill_switch(self, enabled: bool) -> dict:
+    def toggle_kill_switch(self, enabled: bool) -> dict[str, Any]:
         self.kill_switch = enabled
         self._write_kill_switch_file(enabled)
         self._persist_state()
@@ -547,7 +547,7 @@ class PolicyArbiter:
     def _load_runtime_config(self) -> dict[str, Any]:
         try:
             if self.runtime_config_path.exists():
-                return json.loads(self.runtime_config_path.read_text(encoding="utf-8"))
+                return json.loads(self.runtime_config_path.read_text(encoding="utf-8"))  # type: ignore[no-any-return]
         except Exception:
             logger.exception("Failed to load runtime config from %s", self.runtime_config_path)
         return {}
@@ -575,7 +575,10 @@ class PolicyArbiter:
         return DEFAULT_HTTP_REFERER
 
     def _telegram_fallback_binary(self) -> str | None:
-        telegram_cfg = self.runtime_config.get("telegram") if isinstance(self.runtime_config.get("telegram"), dict) else {}
+        telegram_cfg: dict[str, Any] = {}
+        raw = self.runtime_config.get("telegram")
+        if isinstance(raw, dict):
+            telegram_cfg = raw
         configured_binary = str(telegram_cfg.get("fallback_binary") or "").strip()
         if configured_binary:
             return configured_binary
@@ -774,7 +777,7 @@ class PolicyArbiter:
 
         raise ValueError(f"Path {resolved_str} is outside allowed roots")
 
-    def get_status(self) -> dict:
+    def get_status(self) -> dict[str, Any]:
         pending = self._load_json(self.pending_file, default={})
         return {
             "kill_switch": self.kill_switch,
@@ -817,7 +820,7 @@ class PolicyArbiter:
             return [self._sanitize_hypothesis(item) for item in value]
         return value
 
-    def _extract_plan(self, hypothesis: dict) -> list[dict[str, Any]]:
+    def _extract_plan(self, hypothesis: dict[str, Any]) -> list[dict[str, Any]]:
         plan = hypothesis.get("plan", [])
         if isinstance(plan, dict):
             plan = plan.get("steps", [])
@@ -825,7 +828,7 @@ class PolicyArbiter:
             return [step for step in plan if isinstance(step, dict)]
         return []
 
-    def _extract_tools(self, hypothesis: dict) -> list[str]:
+    def _extract_tools(self, hypothesis: dict[str, Any]) -> list[str]:
         tools = []
         for step in self._extract_plan(hypothesis):
             tool_name = step.get("tool") or step.get("action")
@@ -1041,7 +1044,7 @@ class PolicyArbiter:
         hours = float(step.get("hours", 1))
         since = datetime.now(UTC) - timedelta(hours=hours)
 
-        events = self._emitter.query(since=since, limit=50)  # type: ignore[attr-defined]
+        events = self.emitter.query(since=since, limit=50) if self.emitter else []
         if not events:
             return {"status": "ok", "tool": "notification.summarize", "result": {"message": "No recent events"}}
 
@@ -1233,7 +1236,7 @@ class PolicyArbiter:
                 raw = response.read(MAX_TELEGRAM_RESPONSE_BYTES + 1)
             if len(raw) > MAX_TELEGRAM_RESPONSE_BYTES:
                 raise RuntimeError("Telegram response exceeded 256 KiB cap")
-            return json.loads(raw.decode("utf-8"))
+            return json.loads(raw.decode("utf-8"))  # type: ignore[no-any-return]
         except urllib.error.HTTPError as exc:
             body_bytes = exc.read(MAX_TELEGRAM_RESPONSE_BYTES + 1)
             if len(body_bytes) > MAX_TELEGRAM_RESPONSE_BYTES:
@@ -1265,7 +1268,10 @@ class PolicyArbiter:
         return parsed
 
     def _resolve_openclaw_binary(self) -> Path | None:
-        telegram_cfg = self.runtime_config.get("telegram") if isinstance(self.runtime_config.get("telegram"), dict) else {}
+        telegram_cfg: dict[str, Any] = {}
+        raw = self.runtime_config.get("telegram")
+        if isinstance(raw, dict):
+            telegram_cfg = raw
         configured_binary = str(telegram_cfg.get("fallback_binary") or "").strip()
         allowed_paths = {path.expanduser().resolve(strict=False) for path in OPENCLAW_FALLBACK_BINARY_PATHS}
         if configured_binary:
@@ -1325,7 +1331,7 @@ class PolicyArbiter:
             ],
         ]
 
-    def _format_telegram_card(self, hypothesis: dict) -> str:
+    def _format_telegram_card(self, hypothesis: dict[str, Any]) -> str:
         hypothesis_id = str(hypothesis.get("id") or hypothesis.get("hypothesis_id") or "unknown")
         summary = str(hypothesis.get("summary") or hypothesis.get("title") or "No summary provided")
         confidence = hypothesis.get("confidence", "n/a")

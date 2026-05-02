@@ -50,7 +50,7 @@ The result is an advisor that tracks your system's rhythms. It does the obvious 
                                 │ cerebellum.events.*
                                 ▼
         ┌───────────────────────────────────────────────────┐
-        │          🧠 CEREBELLUM (4 components)             │
+        │          🧠 CEREBELLUM (6 components)             │
         │                                                   │
         │  ┌─────────────┐      ┌──────────────────┐        │
         │  │  EVENT BUS  │─────▶│   EVENT STORE    │        │
@@ -93,10 +93,12 @@ The result is an advisor that tracks your system's rhythms. It does the obvious 
 
 | Component | Role | Persistent State |
 | :--- | :--- | :--- |
-| 👁️ **EventBus** | Event ingest and NATS relay | `events.db` |
-| 🧠 **EpisodeStore** | Episodic and successor memory | `hippocampus.kuzu` |
-| 💭 **Proposer** | Hypothesis generation | `hypotheses.db` |
-| ⚖️ **PolicyArbiter** | Policy-gated action arbiter | `pending_approvals.json` |
+|| 👁️ **EventBus** | Event ingest and NATS relay | `events.db` |
+|| 🧠 **EpisodeStore** | Episodic and successor memory | `hippocampus.kuzu` |
+|| 🔗 **Mining** | Successor pattern discovery | `mining.db` |
+|| 💭 **Proposer** | LLM hypothesis generation (grounded) | `hypotheses.db` |
+|| ⚖️ **PolicyArbiter** | Policy-gated action arbiter | `pending_approvals.json` |
+|| 🔄 **FeedbackLoop** | Outcome tracking and learning | `feedback.db` |
 
 ---
 
@@ -117,10 +119,9 @@ Deploy CEREBELLUM in about five minutes.
 ### 1️⃣ Clone and install
 
 ```bash
-git clone https://github.com/jcartu/cerebellum ~/.openclaw/cerebellum
-cd ~/.openclaw/cerebellum
+git clone https://github.com/jcartu/cerebellum && cd cerebellum
 python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
+pip install -e .
 ```
 
 ### 2️⃣ Configure secrets
@@ -143,8 +144,15 @@ chmod 0600 .env
 
 ### 3️⃣ Install services
 
+The `services/` directory contains systemd templates. Fill in the placeholders (`__USER__`, `__CEREBELLUM_BASE_DIR__`, `__PYTHON__`) before deploying:
+
 ```bash
-sudo cp services/*.service /etc/systemd/system/
+# Example: customize and install
+sed -e 's|__USER__|${USER}|g' \
+    -e 's|__CEREBELLUM_BASE_DIR__|$(pwd)|g' \
+    -e 's|__PYTHON__|$(which python3)|g' \
+    services/cerebellum-observatory.service.template > cerebellum-observatory.service
+sudo cp cerebellum-observatory.service cerebellum-cortex.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now cerebellum-observatory cerebellum-cortex
 ```
@@ -211,6 +219,7 @@ CEREBELLUM is **paranoid by default**. If an agent can act on its own, it must f
 - 🔐 **Dashboard Auth** — Bearer tokens required. Binds to loopback by default.
 - 📏 **Response Caps** — Every HTTP response has a byte limit to prevent memory exhaustion.
 - 💾 **Atomic Writes** — State files use temp files and fsync to prevent corruption.
+- 🔒 **NATS TLS** — Optional mutual TLS for all event bus traffic. Server verification or client cert auth via config or environment variables.
 
 ---
 

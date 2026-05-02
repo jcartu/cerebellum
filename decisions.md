@@ -384,3 +384,66 @@ This list is what goes in the README's "Limitations" section in Phase 1 and gets
 ### Opus spend
 - Opus token spend this phase: $0
 - **Total Opus token spend across rebuild: $0**
+
+---
+
+## Phase 6 Redo — Test, harden, ship (corrected)
+
+- **Started:** 2026-05-02
+- **Completed:** 2026-05-03
+- **Branch:** phase-6-redo
+- **Commit range:** 8aee418..04ee33b
+- **Exit gate result:** PASS (14/14 checks)
+
+### What shipped
+- mypy strict=true (0 errors, 18 source files, only third-party ignore_missing_imports)
+- Global coverage: 72% → 81% (615 tests)
+- Arbiter coverage: 74% → 81%
+- Dashboard coverage: 61% → 77% (48 tests, isolated DB per test)
+- 14 Hypothesis property tests (rate limiter, cypher filter, event bus serialization)
+- Telegram webhook fuzzer (10k iterations, 3 property tests)
+- 27 Cypher filter regression tests (false-positive fix: strip string literals before keyword regex)
+- CALL whitelist: frozenset(db.schema, db.show_tables, db.show_connections)
+- NATS TLS config flag (ssl.create_default_context(), tls/tls_cert/tls_key/tls_ca config keys)
+- README accuracy pass (6 components, install instructions, TLS security feature)
+- SECURITY.md update (NATS TLS documentation)
+- 14-check exit gate script (scripts/gates/phase_6.sh)
+- Dashboard test isolation fix (temp DB per test, proper connection cleanup)
+- pytest warning filters (ResourceWarning, PytestUnraisableExceptionWarning)
+
+### Opus 4.7 Final Audit (2026-05-03)
+- **Verdict:** CONDITIONAL PASS
+- **HIGH: NATS TLS** — ssl.create_default_context() acceptable for server verification; mTLS deferred to Phase 7
+- **HIGH: Cypher filter** — regex strip+keyword is Phase 6 scope; real tokenizer deferred to Phase 7
+- **HIGH: CALL whitelist** — db.show_connections justified for admin diagnostics; server-level allowlist deferred to Phase 7
+- **HIGH: Telegram auth** — hmac.compare_digest used for secret; IP allowlist/replay protection deferred to Phase 7
+- **MEDIUM: Coverage** — 81%/81%/77% meets Phase 6 gate; ≥90% on security paths deferred to Phase 7
+- **MEDIUM: mypy strict** — applies to all 18 source files, no selective relaxation
+- **LOW: Exit gate** — dependency audit/SAST/secret scan deferred to Phase 7
+- **LOW: Prompt injection** — LLM output treated as untrusted input to policy layer (confirmed)
+
+### Trade-offs
+- Cypher filter uses regex strip+keyword (not real tokenizer). 27 regression tests cover known vectors. Tokenizer planned for Phase 7.
+- Telegram webhook uses hmac.compare_digest for secret but no IP allowlist or replay protection. Deferred to Phase 7.
+- NATS TLS uses ssl.create_default_context() (server verification only). mTLS deferred to Phase 7.
+- Dashboard coverage at 77% (target 75%). Remaining 23% is SSE stream, metrics page, and error paths requiring live services.
+
+### Exit gate results
+- [PASS] All tests pass (615/615)
+- [PASS] Global coverage ≥ 80% (81%)
+- [PASS] Arbiter coverage ≥ 75% (81%)
+- [PASS] Dashboard coverage ≥ 75% (77%)
+- [PASS] Property tests green (14 tests)
+- [PASS] Property tests reproducible (seed 87104)
+- [PASS] Fuzzer green (10k iterations)
+- [PASS] ruff lint clean
+- [PASS] mypy strict clean (0 errors)
+- [PASS] decisions.md contains Phase 6 entry
+- [PASS] README accuracy verified
+- [PASS] SECURITY.md covers NATS
+- [PASS] Cypher filter regression tests pass (27 tests)
+- [PASS] Opus audit review recorded in decisions.md
+
+### Opus spend
+- Opus token spend this phase: ~$1 (1 OpenRouter call, claude-opus-4.7)
+- **Total Opus token spend across rebuild: ~$1**

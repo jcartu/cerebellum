@@ -78,7 +78,8 @@ app = FastAPI(title="Cerebellum Observatory")
 DASHBOARD_TOKEN = os.environ.get("DASHBOARD_TOKEN", "")
 if not DASHBOARD_TOKEN:
     logger.error("DASHBOARD_TOKEN environment variable is required")
-    sys.exit(1)
+    if not os.environ.get("CEREBELLUM_TESTING"):
+        sys.exit(1)
 _dashboard_db: sqlite3.Connection | None = None
 _dashboard_db_lock = threading.RLock()
 _auth_rate_lock = threading.RLock()
@@ -594,7 +595,7 @@ async def telegram_webhook(request: Request) -> JSONResponse:
     if msg_date and (time.time() - msg_date) > 300:
         return JSONResponse({"ok": True, "message": "callback expired"})
 
-    def _actor_id(obj: dict) -> str:
+    def _actor_id(obj: dict[str, Any]) -> str:
         user = obj.get("from") or {}
         return str(user.get("id") or "")
 

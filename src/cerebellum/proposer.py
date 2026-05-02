@@ -15,7 +15,7 @@ from typing import Any
 try:
     from openai import OpenAI
 except ImportError:  # pragma: no cover - handled gracefully at runtime
-    OpenAI = None  # type: ignore[misc]
+    OpenAI = None  # type: ignore[misc,assignment]
 
 logger = logging.getLogger(__name__)
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -81,7 +81,7 @@ class Proposer:
         "metadata",
     }
 
-    def __init__(self, config_path: str, emitter=None, hippocampus=None):
+    def __init__(self, config_path: str, emitter: Any | None = None, hippocampus: Any | None = None):
         self.config_path = Path(config_path).expanduser()
         self.base_dir = self.config_path.parent
         self.db_path = self.base_dir / "hypotheses.db"
@@ -115,12 +115,12 @@ class Proposer:
             if not self.config_path.exists():
                 logger.warning("Proposer config not found at %s; using defaults", self.config_path)
                 return {}
-            return json.loads(self.config_path.read_text(encoding="utf-8"))
+            return json.loads(self.config_path.read_text(encoding="utf-8"))  # type: ignore[no-any-return]
         except Exception as exc:
             logger.error("Failed to load proposer config %s: %s", self.config_path, exc)
             return {}
 
-    def _build_client(self):
+    def _build_client(self) -> Any | None:
         if not self.api_key:
             logger.warning("OPENROUTER_API_KEY is not set; LLM generation disabled")
             return None
@@ -145,7 +145,7 @@ class Proposer:
             raise RuntimeError("Hypotheses database is not initialized")
         return self._sqlite
 
-    def _init_db(self):
+    def _init_db(self) -> None:
         try:
             self.base_dir.mkdir(parents=True, exist_ok=True)
             with self._db_lock:
@@ -243,7 +243,7 @@ class Proposer:
             logger.error("Failed to generate hypotheses: %s", exc, exc_info=True)
             return []
 
-    def _build_prompt(self, episodes: list, events: list, existing: list) -> str:
+    def _build_prompt(self, episodes: list[dict[str, Any]], events: list[dict[str, Any]], existing: list[dict[str, Any]]) -> str:
         """Build the hypothesis generation prompt."""
         try:
             existing_titles = [str(item.get("title", "")).strip() for item in existing][:10]
@@ -508,7 +508,7 @@ class Proposer:
             except Exception as exc:
                 logger.warning("Proposer WAL checkpoint failed: %s", exc)
 
-    def get_active_hypotheses(self, state: str | None = None, limit: int = 50) -> list[dict]:
+    def get_active_hypotheses(self, state: str | None = None, limit: int = 50) -> list[dict[str, Any]]:
         """Query hypotheses by state."""
         try:
             sql = "SELECT * FROM hypotheses"
@@ -607,7 +607,7 @@ class Proposer:
             logger.error("Failed to expire old hypotheses: %s", exc)
             return 0
 
-    def get_hypothesis_stats(self) -> dict:
+    def get_hypothesis_stats(self) -> dict[str, Any]:
         """Return counts by state, avg confidence, etc."""
         try:
             with self._db_lock:
@@ -725,8 +725,8 @@ class Proposer:
     def _coerce_hypothesis(
         self,
         item: dict[str, Any],
-        episodes: list,
-        events: list,
+        episodes: list[dict[str, Any]],
+        events: list[dict[str, Any]],
         usage: dict[str, Any] | None = None,
     ) -> Hypothesis | None:
         try:
@@ -749,7 +749,8 @@ class Proposer:
             context_summary = str(item.get("context_summary", "")).strip() or self._fallback_context_summary(
                 episodes, events
             )
-            metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+            raw_metadata = item.get("metadata")
+            metadata: dict[str, Any] = raw_metadata if isinstance(raw_metadata, dict) else {}
             metadata.setdefault("source", "llm")
             metadata.setdefault("model_candidates", self.model_candidates)
             usage = usage or {}
@@ -825,12 +826,12 @@ class Proposer:
         cost_usd = (prompt * prompt_price + completion * completion_price) / 1_000_000.0
         return max(0.0, min(1.0, round(cost_usd, 6)))
 
-    def _fallback_context_summary(self, episodes: list, events: list) -> str:
+    def _fallback_context_summary(self, episodes: list[dict[str, Any]], events: list[dict[str, Any]]) -> str:
         return (
             f"Derived from {len(episodes)} recent episodes and {len(events)} recent events observed by CEREBELLUM."
         )
 
-    def _get_relevant_patterns(self, events: list) -> list[dict[str, Any]]:
+    def _get_relevant_patterns(self, events: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Get successor patterns relevant to recent events for the prompt."""
         try:
             from cerebellum.mining import get_relevant_patterns

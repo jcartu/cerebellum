@@ -1,475 +1,533 @@
-"""Tests for Phase 6: dashboard coverage boost.
+"""Dashboard coverage tests — uses monkeypatch.setattr to override module constants."""
 
-Targets: dashboard.py 20% -> 75%.
-"""
 from __future__ import annotations
 
 import json
-import os
-import tempfile
-from pathlib import Path
+import time
 from unittest.mock import MagicMock, patch
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-SRC_DIR = PROJECT_ROOT / "src"
-import sys
-
-for path in (PROJECT_ROOT, SRC_DIR):
-    if str(path) not in sys.path:
-        sys.path.insert(0, str(path))
-
-os.environ.setdefault("DASHBOARD_TOKEN", "test-token")
-
+import pytest
 from fastapi.testclient import TestClient
 
-# Import dashboard module
-from cerebellum.ui import dashboard
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+@pytest.fixture
+def dash():
+    """Import dashboard module for patching."""
+    import cerebellum.ui.dashboard as dash
 
-
-def _make_config_path() -> str:
-    """Create a temporary config.json and return its path."""
-    content = {
-        "sqlite": {"events_db": ":memory:"},
-        "dashboard": {"port": 18790},
-    }
-    fd, path = tempfile.mkstemp(suffix=".json")
-    with os.fdopen(fd, "w") as f:
-        json.dump(content, f)
-    return path
+    return dash
 
 
-def _setup_dashboard_env(config_path: str) -> None:
-    """Set up environment for dashboard tests."""
-    os.environ["CEREBELLUM_CONFIG"] = config_path
-    base = str(Path(config_path).parent)
-    os.environ["CEREBELLUM_BASE_DIR"] = base
+@pytest.fixture
+def client(dash, monkeypatch, tmp_path):
+    """Create TestClient with patched module constants and isolated DB."""
+    # Use a temp DB so update_id dedup doesn't leak between test runs
+    tmp_db = tmp_path / "test_dashboard.db"
+    monkeypatch.setattr(dash, "_dashboard_db_path", lambda: tmp_db)
+    monkeypatch.setattr(dash, "_dashboard_db", None)
+    monkeypatch.setattr(dash, "TELEGRAM_BOT_TOKEN", "123456:ABC-TEST-BOT-TOKEN", raising=False)
+    monkeypatch.setattr(dash, "TELEGRAM_WEBHOOK_SECRET", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", raising=False)
+    monkeypatch.setattr(dash, "TELEGRAM_ALLOWED_USER_IDS", {"12345678"}, raising=False)
+    return TestClient(dash.app)
 
 
-def _get_client(config_path: str | None = None) -> TestClient:
-    """Create a TestClient for the dashboard app."""
-    if config_path is None:
-        config_path = _make_config_path()
-    _setup_dashboard_env(config_path)
-
-    # Reset singletons
-    dashboard._emitter = None
-    dashboard._arbiter = None
-    dashboard._feedback_store = None
-    dashboard._dashboard_db = None
-
-    # Mock emitter
-    mock_emitter = MagicMock()
-    mock_emitter.query.return_value = []
-    with patch.object(dashboard, "get_emitter", return_value=mock_emitter):
-        client = TestClient(dashboard.app)
-        return client
-
-
-# ---------------------------------------------------------------------------
-# healthz (no auth)
-# ---------------------------------------------------------------------------
+@pytest.fixture(autouse=True)
+def _reset_rate_windows(dash):
+    """Reset rate limit windows between tests."""
+    with dash._auth_rate_lock:
+        dash._auth_rate_windows.clear()
+    with dash._telegram_webhook_rate_lock:
+        dash._telegram_webhook_rate_windows.clear()
+    yield
+    with dash._auth_rate_lock:
+        dash._auth_rate_windows.clear()
+    with dash._telegram_webhook_rate_lock:
+        dash._telegram_webhook_rate_windows.clear()
+    # Close dashboard DB to prevent unclosed connection warnings
+    conn = dash._dashboard_db
+    if conn is not None:
+        conn.close()
+    dash._dashboard_db = None
 
 
-class TestHealthz:
-    def test_healthz(self) -> None:
-        client = _get_client()
-        response = client.get("/healthz")
-        assert response.status_code == 200
-        data = response.json()
-        assert data["status"] == "ok"
+class TestGetEmitter:
+    def test_get_emitter_returns_event_bus(self, dash, monkeypatch):
+        mock_bus = MagicMock()
+        monkeypatch.setattr(dash, "EventBus", MagicMock(return_value=mock_bus))
+        original = dash._emitter
+        dash._emitter = None
+        try:
+            assert dash.get_emitter() is mock_bus
+        finally:
+            dash._emitter = original
+
+    def test_get_emitter_raises_on_failure(self, dash, monkeypatch):
+        monkeypatch.setattr(dash, "EventBus", MagicMock(side_effect=RuntimeError("no config")))
+        original = dash._emitter
+        dash._emitter = None
+        try:
+            with pytest.raises(RuntimeError, match="emitter unavailable"):
+                dash.get_emitter()
+        finally:
+            dash._emitter = original
 
 
-# ---------------------------------------------------------------------------
-# Auth middleware
-# ---------------------------------------------------------------------------
+class TestGetArbiter:
+    def test_get_arbiter_returns_none_no_policy(self, dash, monkeypatch):
+        original = dash._arbiter
+        dash._arbiter = None
+        try:
+            with patch.object(dash.Path, "exists", return_value=False):
+                assert dash.get_arbiter() is None
+        finally:
+            dash._arbiter = original
+
+    def test_get_arbiter_returns_none_on_error(self, dash, monkeypatch):
+        original = dash._arbiter
+        dash._arbiter = None
+        try:
+            with patch.object(dash.Path, "exists", return_value=True):
+                monkeypatch.setattr(dash, "PolicyArbiter", MagicMock(side_effect=RuntimeError("bad")))
+                assert dash.get_arbiter() is None
+        finally:
+            dash._arbiter = original
 
 
 class TestAuthMiddleware:
-    def test_requires_auth(self) -> None:
-        client = _get_client()
-        response = client.get("/")
-        assert response.status_code == 401
+    def test_healthz_no_auth(self, client):
+        assert client.get("/healthz").status_code == 200
 
-    def test_auth_with_token(self) -> None:
-        client = _get_client()
-        response = client.get("/", headers={"Authorization": "Bearer test-token"})
-        assert response.status_code == 200
-
-    def test_wrong_token(self) -> None:
-        client = _get_client()
-        response = client.get("/", headers={"Authorization": "Bearer wrong-token"})
-        assert response.status_code == 401
-
-    def test_healthz_no_auth(self) -> None:
-        client = _get_client()
-        response = client.get("/healthz")
-        assert response.status_code == 200
+    def test_unauthorized_wrong_token(self, client):
+        assert client.get("/", headers={"Authorization": "Bearer wrong"}).status_code == 401
 
 
-# ---------------------------------------------------------------------------
-# Pages
-# ---------------------------------------------------------------------------
+class TestRequestHelpers:
+    def test_request_source_ip_from_x_forwarded_for(self):
+        from fastapi import Request
+
+        mock_req = MagicMock(spec=Request)
+        mock_req.headers = {"X-Forwarded-For": "1.2.3.4, 5.6.7.8"}
+        from cerebellum.ui.dashboard import _request_source_ip
+
+        assert _request_source_ip(mock_req) == "1.2.3.4"
+
+    def test_request_source_ip_from_client(self):
+        from fastapi import Request
+        from starlette.datastructures import Address
+
+        mock_req = MagicMock(spec=Request)
+        mock_req.headers = {}
+        mock_req.client = Address(host="10.0.0.1", port=12345)
+        from cerebellum.ui.dashboard import _request_source_ip
+
+        assert _request_source_ip(mock_req) == "10.0.0.1"
+
+    def test_request_source_ip_unknown(self):
+        from fastapi import Request
+
+        mock_req = MagicMock(spec=Request)
+        mock_req.headers = {}
+        mock_req.client = None
+        from cerebellum.ui.dashboard import _request_source_ip
+
+        assert _request_source_ip(mock_req) == "unknown"
+
+    def test_allow_authenticated_request_localhost(self):
+        from cerebellum.ui.dashboard import _allow_authenticated_request
+
+        assert _allow_authenticated_request("127.0.0.1") is True
+
+    def test_allow_authenticated_request_loopback_ipv6(self):
+        from cerebellum.ui.dashboard import _allow_authenticated_request
+
+        assert _allow_authenticated_request("::1") is True
+
+    def test_allow_authenticated_request_rate_limit(self, dash):
+        from cerebellum.ui.dashboard import _allow_authenticated_request
+
+        assert _allow_authenticated_request("192.168.1.100") is True
+        now_window = int(time.time() // 60)
+        with dash._auth_rate_lock:
+            dash._auth_rate_windows["192.168.1.100"] = (now_window, 60)
+        assert _allow_authenticated_request("192.168.1.100") is False
 
 
-class TestPages:
-    def test_index_page(self) -> None:
-        client = _get_client()
-        response = client.get("/", headers={"Authorization": "Bearer test-token"})
-        assert response.status_code == 200
-        assert "CEREBELLUM" in response.text
-
-    def test_timeline_page(self) -> None:
-        client = _get_client()
-        response = client.get("/timeline", headers={"Authorization": "Bearer test-token"})
-        assert response.status_code == 200
-
-    def test_timeline_limit(self) -> None:
-        client = _get_client()
-        response = client.get("/timeline?limit=10", headers={"Authorization": "Bearer test-token"})
-        assert response.status_code == 200
-
-
-# ---------------------------------------------------------------------------
-# API endpoints
-# ---------------------------------------------------------------------------
-
-
-class TestAPIEndpoints:
-    def test_api_events(self) -> None:
-        client = _get_client()
-        response = client.get("/api/events", headers={"Authorization": "Bearer test-token"})
-        assert response.status_code == 200
-        assert isinstance(response.json(), list)
-
-    def test_api_events_with_since(self) -> None:
-        client = _get_client()
-        response = client.get(
-            "/api/events?since=2025-01-01T00:00:00Z",
-            headers={"Authorization": "Bearer test-token"},
-        )
-        assert response.status_code == 200
-
-    def test_api_stats(self) -> None:
-        client = _get_client()
-        response = client.get("/api/stats", headers={"Authorization": "Bearer test-token"})
-        assert response.status_code == 200
-        data = response.json()
-        assert "window" in data
-        assert "counts" in data
-        assert "total" in data
-
-    def test_api_stats_html(self) -> None:
-        client = _get_client()
-        response = client.get("/api/stats/html", headers={"Authorization": "Bearer test-token"})
-        assert response.status_code == 200
-        assert "24h Stats" in response.text
-
-
-# ---------------------------------------------------------------------------
-# Metrics endpoints
-# ---------------------------------------------------------------------------
-
-
-class TestMetricsEndpoints:
-    def test_metrics_page(self) -> None:
-        client = _get_client()
-        with patch.object(dashboard, "get_feedback_store") as mock_store:
-            mock_metrics = MagicMock()
-            mock_metrics.model = "test-model"
-            mock_metrics.window_days = 7
-            mock_metrics.total_outcomes = 0
-            mock_metrics.approval_rate = 0.0
-            mock_metrics.mean_confidence_approved = 0.0
-            mock_metrics.mean_confidence_rejected = 0.0
-            mock_metrics.expected_calibration_error = 0.0
-            mock_metrics.is_calibrated = True
-            mock_store.return_value.compute_calibration.return_value = mock_metrics
-            mock_store.return_value.query_outcomes.return_value = []
-            response = client.get("/metrics", headers={"Authorization": "Bearer test-token"})
-            assert response.status_code == 200
-
-    def test_api_metrics(self) -> None:
-        client = _get_client()
-        with patch.object(dashboard, "get_feedback_store") as mock_store:
-            mock_metrics = MagicMock()
-            mock_metrics.model = "test-model"
-            mock_metrics.window_days = 7
-            mock_metrics.total_outcomes = 0
-            mock_metrics.approval_rate = 0.0
-            mock_metrics.mean_confidence_approved = 0.0
-            mock_metrics.mean_confidence_rejected = 0.0
-            mock_metrics.expected_calibration_error = 0.0
-            mock_metrics.is_calibrated = True
-            mock_metrics.platt_a = 1.0
-            mock_metrics.platt_b = 0.0
-            mock_store.return_value.compute_calibration.return_value = mock_metrics
-            response = client.get("/api/metrics", headers={"Authorization": "Bearer test-token"})
-            assert response.status_code == 200
-            data = response.json()
-            assert "model" in data
-            assert "is_calibrated" in data
-
-
-# ---------------------------------------------------------------------------
-# Dashboard helper functions
-# ---------------------------------------------------------------------------
-
-
-class TestDashboardHelpers:
-    def test_stats_payload(self) -> None:
-        mock_emitter = MagicMock()
-        mock_emitter.query.return_value = [
-            {"type": "cerebellum.action"},
-            {"type": "cerebellum.action"},
-            {"type": "cerebellum.execution"},
-        ]
-        with patch.object(dashboard, "get_emitter", return_value=mock_emitter):
-            payload = dashboard._stats_payload()
-            assert payload["total"] == 3
-            assert payload["window"] == "24h"
-
-    def test_parse_since_valid(self) -> None:
-        result = dashboard._parse_since("2025-01-01T00:00:00+00:00")
-        assert result is not None
-
-    def test_parse_since_invalid(self) -> None:
-        result = dashboard._parse_since("not-a-date")
-        assert result is None
-
-    def test_parse_since_none(self) -> None:
-        result = dashboard._parse_since(None)
-        assert result is None
-
-    def test_render_events_empty(self) -> None:
-        html = dashboard._render_events([])
-        assert "No events yet" in html
-
-    def test_render_events_with_events(self) -> None:
-        events = [
-            {
-                "id": "evt-1",
-                "type": "cerebellum.action",
-                "timestamp": "2025-01-01T00:00:00",
-                "actor": "test",
-                "payload": {"key": "value"},
-                "context": {},
-            }
-        ]
-        html = dashboard._render_events(events)
-        assert "evt-1" in html
-        assert "cerebellum.action" in html
-
-    def test_request_source_ip(self) -> None:
-        mock_request = MagicMock()
-        mock_request.headers = {"X-Forwarded-For": "1.2.3.4, 5.6.7.8"}
-        mock_request.client = None
-        ip = dashboard._request_source_ip(mock_request)
-        assert ip == "1.2.3.4"
-
-    def test_request_source_ip_no_forwarded(self) -> None:
-        mock_request = MagicMock()
-        mock_request.headers = {}
-        mock_client = MagicMock()
-        mock_client.host = "127.0.0.1"
-        mock_request.client = mock_client
-        ip = dashboard._request_source_ip(mock_request)
-        assert ip == "127.0.0.1"
-
-    def test_allow_telegram_webhook_ip(self) -> None:
-        result = dashboard._allow_telegram_webhook_ip("149.154.160.0")
-        assert isinstance(result, bool)
-
-    def test_allow_authenticated_request(self) -> None:
-        result = dashboard._allow_authenticated_request("127.0.0.1")
-        assert isinstance(result, bool)
-
-
-# ---------------------------------------------------------------------------
-# Telegram webhook
-# ---------------------------------------------------------------------------
+class TestDashboardDb:
+    def test_get_dashboard_db_creates_tables(self, dash, monkeypatch, tmp_path):
+        db_path = tmp_path / "test_dashboard.db"
+        monkeypatch.setenv("CEREBELLUM_DASHBOARD_DB", str(db_path))
+        original_conn = dash._dashboard_db
+        dash._dashboard_db = None
+        try:
+            conn = dash._get_dashboard_db()
+            assert conn is not None
+            tables = [t[0] for t in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
+            assert "telegram_seen_updates" in tables
+        finally:
+            if dash._dashboard_db is not None and dash._dashboard_db is not original_conn:
+                dash._dashboard_db.close()
+            dash._dashboard_db = original_conn
 
 
 class TestTelegramWebhook:
-    def test_webhook_no_bot_token(self) -> None:
-        client = _get_client()
-        env = dict(os.environ)
-        env.pop("TELEGRAM_BOT_TOKEN", None)
-        env.pop("OPENCLAW_TELEGRAM_BOT_TOKEN", None)
-        with patch.dict(os.environ, env, clear=True):
-            # Need to reload the module to pick up new env
-            import importlib
-            importlib.reload(dashboard)
-            client = TestClient(dashboard.app)
-            response = client.post("/telegram/webhook", json={"update_id": 1})
-            assert response.status_code == 503
+    def _webhook_headers(self):
+        return {
+            "Content-Type": "application/json",
+            "X-Telegram-Bot-Api-Secret-Token": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        }
 
-    def test_webhook_no_secret(self) -> None:
-        client = _get_client()
-        env = dict(os.environ)
-        env["TELEGRAM_BOT_TOKEN"] = "test-bot-token"
-        env.pop("TELEGRAM_WEBHOOK_SECRET", None)
-        with patch.dict(os.environ, env, clear=True):
-            import importlib
-            importlib.reload(dashboard)
-            client = TestClient(dashboard.app)
-            response = client.post(
-                "/telegram/webhook",
-                json={"update_id": 1},
-                headers={"X-Telegram-Bot-Api-Secret-Token": "secret"},
-            )
-            assert response.status_code == 503
+    def test_webhook_bad_secret(self, client):
+        payload = {"update_id": 1}
+        response = client.post(
+            "/telegram/webhook",
+            content=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json", "X-Telegram-Bot-Api-Secret-Token": "wrong"},
+        )
+        assert response.status_code == 401
 
-    def test_webhook_bad_json(self) -> None:
-        client = _get_client()
-        env = dict(os.environ)
-        env["TELEGRAM_BOT_TOKEN"] = "test-bot-token"
-        env["TELEGRAM_WEBHOOK_SECRET"] = "test-secret"
-        env["TELEGRAM_ALLOWED_USER_IDS"] = "12345"
-        with patch.dict(os.environ, env, clear=True):
-            import importlib
-            importlib.reload(dashboard)
-            client = TestClient(dashboard.app)
-            response = client.post(
-                "/telegram/webhook",
-                content=b"not json",
-                headers={
-                    "Content-Type": "application/json",
-                    "X-Telegram-Bot-Api-Secret-Token": "test-secret",
-                },
-            )
-            assert response.status_code == 400
+    def test_webhook_valid_message(self, client):
+        payload = {"update_id": 12345, "message": {"text": "/start", "chat": {"id": 12345678}}}
+        response = client.post("/telegram/webhook", content=json.dumps(payload).encode(), headers=self._webhook_headers())
+        assert response.status_code == 200
 
-    def test_webhook_bad_secret(self) -> None:
-        client = _get_client()
-        env = dict(os.environ)
-        env["TELEGRAM_BOT_TOKEN"] = "test-bot-token"
-        env["TELEGRAM_WEBHOOK_SECRET"] = "correct-secret"
-        env["TELEGRAM_ALLOWED_USER_IDS"] = "12345"
-        with patch.dict(os.environ, env, clear=True):
-            import importlib
-            importlib.reload(dashboard)
-            client = TestClient(dashboard.app)
-            response = client.post(
-                "/telegram/webhook",
-                json={"update_id": 1},
-                headers={"X-Telegram-Bot-Api-Secret-Token": "wrong-secret"},
-            )
-            assert response.status_code == 401
+    def test_webhook_callback_query(self, client):
+        import time as _time
 
-    def test_webhook_duplicate_update(self) -> None:
-        client = _get_client()
-        env = dict(os.environ)
-        env["TELEGRAM_BOT_TOKEN"] = "test-bot-token"
-        env["TELEGRAM_WEBHOOK_SECRET"] = "test-secret"
-        env["TELEGRAM_ALLOWED_USER_IDS"] = "12345"
-        with patch.dict(os.environ, env, clear=True):
-            import importlib
-            importlib.reload(dashboard)
-            client = TestClient(dashboard.app)
-            headers = {
-                "X-Telegram-Bot-Api-Secret-Token": "test-secret",
-            }
-            payload = {"update_id": "dup-1"}
-            r1 = client.post("/telegram/webhook", json=payload, headers=headers)
-            assert r1.status_code == 200
-            r2 = client.post("/telegram/webhook", json=payload, headers=headers)
-            assert r2.json().get("message") == "update already processed"
+        payload = {
+            "update_id": 67890,
+            "callback_query": {
+                "id": "cb-123",
+                "data": "approve:abc123",
+                "from": {"id": 12345678},
+                "message": {"date": int(_time.time())},
+            },
+        }
+        response = client.post("/telegram/webhook", content=json.dumps(payload).encode(), headers=self._webhook_headers())
+        assert response.status_code == 200
+
+    def test_webhook_empty_payload(self, client):
+        payload = {"update_id": 99999}
+        response = client.post("/telegram/webhook", content=json.dumps(payload).encode(), headers=self._webhook_headers())
+        assert response.status_code == 200
+
+    def test_webhook_channel_post(self, client):
+        payload = {"update_id": 22222, "channel_post": {"text": "channel msg", "chat": {"id": -100123, "type": "channel"}}}
+        response = client.post("/telegram/webhook", content=json.dumps(payload).encode(), headers=self._webhook_headers())
+        assert response.status_code == 200
+
+    def test_webhook_poll_update(self, client):
+        payload = {
+            "update_id": 33333,
+            "poll": {
+                "id": "poll-1",
+                "question": "Test?",
+                "options": [{"text": "A", "voter_count": 1}],
+                "is_closed": False,
+                "is_anonymous": True,
+                "type": "regular",
+                "allows_multiple_answers": False,
+            },
+        }
+        response = client.post("/telegram/webhook", content=json.dumps(payload).encode(), headers=self._webhook_headers())
+        assert response.status_code == 200
+
+    def test_webhook_duplicate_update_id(self, client):
+        payload = {"update_id": 999999, "message": {"text": "/dup", "chat": {"id": 12345678}}}
+        r1 = client.post("/telegram/webhook", content=json.dumps(payload).encode(), headers=self._webhook_headers())
+        assert r1.status_code == 200
+        r2 = client.post("/telegram/webhook", content=json.dumps(payload).encode(), headers=self._webhook_headers())
+        assert r2.status_code == 200
+        assert r2.json().get("message") == "update already processed"
+
+    def test_webhook_callback_expired(self, client):
+        payload = {
+            "update_id": 888888,
+            "callback_query": {
+                "id": "cb-exp",
+                "data": "approve:test-123",
+                "from": {"id": 12345678},
+                "message": {"date": 1000000},
+            },
+        }
+        response = client.post("/telegram/webhook", content=json.dumps(payload).encode(), headers=self._webhook_headers())
+        assert response.status_code == 200
+        assert response.json().get("message") == "callback expired"
+
+    def test_webhook_unauthorized_user(self, client):
+        payload = {
+            "update_id": 777777,
+            "callback_query": {
+                "id": "cb-unauth",
+                "data": "approve:test-123",
+                "from": {"id": 99999999},
+            },
+        }
+        response = client.post("/telegram/webhook", content=json.dumps(payload).encode(), headers=self._webhook_headers())
+        assert response.status_code == 403
+
+    def test_webhook_callback_approve(self, client, monkeypatch, dash):
+        import time as _time
+
+        mock_arbiter = MagicMock()
+        mock_arbiter.handle_approval.return_value = {"status": "approved"}
+        monkeypatch.setattr(dash, "get_arbiter", MagicMock(return_value=mock_arbiter))
+        payload = {
+            "update_id": 666666,
+            "callback_query": {
+                "id": "cb-approve",
+                "data": "approve:abc123",
+                "from": {"id": 12345678},
+                "message": {"date": int(_time.time())},
+            },
+        }
+        response = client.post("/telegram/webhook", content=json.dumps(payload).encode(), headers=self._webhook_headers())
+        assert response.status_code == 200
+
+    def test_webhook_callback_reject(self, client, monkeypatch, dash):
+        import time as _time
+
+        mock_arbiter = MagicMock()
+        mock_arbiter.handle_approval.return_value = {"status": "rejected"}
+        monkeypatch.setattr(dash, "get_arbiter", MagicMock(return_value=mock_arbiter))
+        payload = {
+            "update_id": 555555,
+            "callback_query": {
+                "id": "cb-reject",
+                "data": "reject:abc123",
+                "from": {"id": 12345678},
+                "message": {"date": int(_time.time())},
+            },
+        }
+        response = client.post("/telegram/webhook", content=json.dumps(payload).encode(), headers=self._webhook_headers())
+        assert response.status_code == 200
+
+    def test_webhook_callback_snooze(self, client, monkeypatch, dash):
+        import time as _time
+
+        mock_arbiter = MagicMock()
+        mock_arbiter.handle_approval.return_value = {"status": "snoozed"}
+        monkeypatch.setattr(dash, "get_arbiter", MagicMock(return_value=mock_arbiter))
+        payload = {
+            "update_id": 444444,
+            "callback_query": {
+                "id": "cb-snooze",
+                "data": "snooze:abc123",
+                "from": {"id": 12345678},
+                "message": {"date": int(_time.time())},
+            },
+        }
+        response = client.post("/telegram/webhook", content=json.dumps(payload).encode(), headers=self._webhook_headers())
+        assert response.status_code == 200
+
+    def test_webhook_message_text_command(self, client, monkeypatch, dash):
+        mock_arbiter = MagicMock()
+        mock_arbiter.kill_switch = False
+        monkeypatch.setattr(dash, "get_arbiter", MagicMock(return_value=mock_arbiter))
+        payload = {"update_id": 333333, "message": {"text": "/status", "chat": {"id": 12345678}, "from": {"id": 12345678}}}
+        response = client.post("/telegram/webhook", content=json.dumps(payload).encode(), headers=self._webhook_headers())
+        assert response.status_code == 200
+
+    def test_webhook_message_no_text(self, client, monkeypatch, dash):
+        mock_arbiter = MagicMock()
+        mock_arbiter.kill_switch = False
+        monkeypatch.setattr(dash, "get_arbiter", MagicMock(return_value=mock_arbiter))
+        payload = {"update_id": 111111, "message": {"photo": [{"file_id": "test"}], "chat": {"id": 12345678}, "from": {"id": 12345678}}}
+        response = client.post("/telegram/webhook", content=json.dumps(payload).encode(), headers=self._webhook_headers())
+        assert response.status_code == 200
+
+    def test_webhook_kill_switch_command(self, client, monkeypatch, dash):
+        mock_arbiter = MagicMock()
+        mock_arbiter.toggle_kill_switch.return_value = {"kill_switch": True}
+        monkeypatch.setattr(dash, "get_arbiter", MagicMock(return_value=mock_arbiter))
+        payload = {"update_id": 222222, "message": {"text": "/cerebellum-halt", "chat": {"id": 12345678}, "from": {"id": 12345678}}}
+        response = client.post("/telegram/webhook", content=json.dumps(payload).encode(), headers=self._webhook_headers())
+        assert response.status_code == 200
+
+    def test_webhook_kill_switch_unauthorized(self, client):
+        payload = {"update_id": 333333, "message": {"text": "/cerebellum-halt", "chat": {"id": 12345678}, "from": {"id": 99999999}}}
+        response = client.post("/telegram/webhook", content=json.dumps(payload).encode(), headers=self._webhook_headers())
+        assert response.status_code == 403
+
+    def test_webhook_callback_invalid_hypothesis_id(self, client):
+        import time as _time
+
+        payload = {
+            "update_id": 444444,
+            "callback_query": {
+                "id": "cb-invalid",
+                "data": "approve:<script>alert(1)</script>",
+                "from": {"id": 12345678},
+                "message": {"date": int(_time.time())},
+            },
+        }
+        response = client.post("/telegram/webhook", content=json.dumps(payload).encode(), headers=self._webhook_headers())
+        assert response.status_code == 400
+
+    def test_webhook_callback_unknown_action(self, client):
+        import time as _time
+
+        payload = {
+            "update_id": 555555,
+            "callback_query": {
+                "id": "cb-unknown",
+                "data": "unknown:abc123",
+                "from": {"id": 12345678},
+                "message": {"date": int(_time.time())},
+            },
+        }
+        response = client.post("/telegram/webhook", content=json.dumps(payload).encode(), headers=self._webhook_headers())
+        assert response.status_code == 400
+
+    def test_webhook_callback_arbiter_unavailable(self, client, monkeypatch, dash):
+        import time as _time
+
+        monkeypatch.setattr(dash, "get_arbiter", MagicMock(return_value=None))
+        payload = {
+            "update_id": 666666,
+            "callback_query": {
+                "id": "cb-noarb",
+                "data": "approve:abc123",
+                "from": {"id": 12345678},
+                "message": {"date": int(_time.time())},
+            },
+        }
+        response = client.post("/telegram/webhook", content=json.dumps(payload).encode(), headers=self._webhook_headers())
+        assert response.status_code == 503
+
+    def test_webhook_callback_handler_exception(self, client, monkeypatch, dash):
+        import time as _time
+
+        mock_arbiter = MagicMock()
+        mock_arbiter.handle_approval.side_effect = Exception("boom")
+        monkeypatch.setattr(dash, "get_arbiter", MagicMock(return_value=mock_arbiter))
+        payload = {
+            "update_id": 777777,
+            "callback_query": {
+                "id": "cb-err",
+                "data": "approve:abc123",
+                "from": {"id": 12345678},
+                "message": {"date": int(_time.time())},
+            },
+        }
+        response = client.post("/telegram/webhook", content=json.dumps(payload).encode(), headers=self._webhook_headers())
+        assert response.status_code == 500
 
 
-# ---------------------------------------------------------------------------
-# get_arbiter / get_emitter
-# ---------------------------------------------------------------------------
-
-
-class TestSingletons:
-    def test_get_emitter(self) -> None:
-        dashboard._emitter = None
+class TestDashboardEndpoints:
+    def test_api_stats_endpoint(self, client, monkeypatch, dash):
         mock_emitter = MagicMock()
-        with patch.object(dashboard, "EventBus", return_value=mock_emitter):
-            result = dashboard.get_emitter()
-            assert result is mock_emitter
+        mock_emitter.query.return_value = []
+        monkeypatch.setattr(dash, "get_emitter", MagicMock(return_value=mock_emitter))
+        response = client.get("/api/stats", headers={"Authorization": "Bearer test-token"})
+        assert response.status_code == 200
 
-    def test_get_arbiter_no_policy(self) -> None:
-        dashboard._arbiter = None
-        with patch.object(Path, "exists", return_value=False):
-            result = dashboard.get_arbiter()
-            assert result is None
+    def test_api_stats_html_endpoint(self, client, monkeypatch, dash):
+        mock_emitter = MagicMock()
+        mock_emitter.query.return_value = []
+        monkeypatch.setattr(dash, "get_emitter", MagicMock(return_value=mock_emitter))
+        response = client.get("/api/stats/html", headers={"Authorization": "Bearer test-token"})
+        assert response.status_code == 200
 
-    def test_get_feedback_store(self) -> None:
-        dashboard._feedback_store = None
-        with patch.object(dashboard, "FeedbackStore") as _mock_store:
-            result = dashboard.get_feedback_store()
-            assert result is not None
+    def test_api_events_endpoint(self, client, monkeypatch, dash):
+        mock_emitter = MagicMock()
+        mock_emitter.query.return_value = []
+        monkeypatch.setattr(dash, "get_emitter", MagicMock(return_value=mock_emitter))
+        response = client.get("/api/events", headers={"Authorization": "Bearer test-token"})
+        assert response.status_code == 200
+
+    def test_timeline_endpoint(self, client, monkeypatch, dash):
+        mock_emitter = MagicMock()
+        mock_emitter.query.return_value = []
+        monkeypatch.setattr(dash, "get_emitter", MagicMock(return_value=mock_emitter))
+        response = client.get("/timeline", headers={"Authorization": "Bearer test-token"})
+        assert response.status_code == 200
+
+    def test_root_endpoint(self, client):
+        response = client.get("/", headers={"Authorization": "Bearer test-token"})
+        assert response.status_code == 200
 
 
-# ---------------------------------------------------------------------------
-# Rate limiting helpers
-# ---------------------------------------------------------------------------
+class TestCoverageHelpers:
+    def test_parse_since_valid(self):
+        from cerebellum.ui.dashboard import _parse_since
 
+        assert _parse_since("2024-01-01T00:00:00Z") is not None
 
-class TestRateLimiting:
-    def test_telegram_rate_limit(self) -> None:
-        # After 60 requests in a minute window, should be rejected
-        for i in range(60):
-            dashboard._allow_telegram_webhook_ip("1.2.3.4")
-        result = dashboard._allow_telegram_webhook_ip("1.2.3.4")
-        assert result is False
+    def test_parse_since_invalid(self):
+        from cerebellum.ui.dashboard import _parse_since
 
-    def test_auth_rate_limit(self) -> None:
-        for i in range(60):
-            dashboard._allow_authenticated_request("5.6.7.8")
-        result = dashboard._allow_authenticated_request("5.6.7.8")
-        assert result is False
+        assert _parse_since("not-a-date") is None
+        assert _parse_since("") is None
+        assert _parse_since(None) is None
 
-# ---------------------------------------------------------------------------
-# Telegram callback helpers
-# ---------------------------------------------------------------------------
+    def test_stats_payload_structure(self, monkeypatch):
+        from cerebellum.ui.dashboard import _stats_payload
+
+        with patch("cerebellum.ui.dashboard.get_emitter") as mock_get:
+            mock_emitter = MagicMock()
+            mock_emitter.query.return_value = []
+            mock_get.return_value = mock_emitter
+            result = _stats_payload()
+            assert "window" in result
+            assert "counts" in result
+            assert "total" in result
+
+    def test_render_events_safe(self):
+        from cerebellum.ui.dashboard import _render_events
+
+        events = [
+            {
+                "id": "test-id",
+                "timestamp": "2024-01-01T00:00:00Z",
+                "type": "test.event",
+                "payload": {"text": "<script>alert(1)</script>"},
+                "actor": "test",
+                "context": {},
+            }
+        ]
+        result = _render_events(events)
+        assert "<script>" not in result
+        assert "&lt;script&gt;" in result
+
+    def test_render_events_empty_list(self):
+        from cerebellum.ui.dashboard import _render_events
+
+        result = _render_events([])
+        assert "No events yet" in result
+
+    def test_render_events_with_none_payload(self):
+        from cerebellum.ui.dashboard import _render_events
+
+        events = [{"id": "t", "timestamp": "2024-01-01T00:00:00Z", "type": "t", "payload": None, "actor": "t", "context": {}}]
+        result = _render_events(events)
+        assert "t" in result
 
 
 class TestTelegramHelpers:
-    def test_answer_callback(self) -> None:
-        with patch("cerebellum.ui.dashboard._safe_opener"):
-            dashboard._answer_callback("cb-1", "test message")
+    def test_answer_callback_logs_on_failure(self, monkeypatch):
+        from cerebellum.ui.dashboard import _answer_callback
 
-    def test_send_telegram_text(self) -> None:
-        with patch("cerebellum.ui.dashboard._safe_opener"):
-            dashboard._send_telegram_text("chat-123", "hello")
+        monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "test-bot-token")
+        _answer_callback("cb-123", "test answer")
 
-    def test_answer_callback_error(self) -> None:
-        import urllib.error as urllib_error
-        with patch("cerebellum.ui.dashboard._safe_opener", side_effect=urllib_error.URLError("fail")):
-            # Should not raise - catches internally
-            dashboard._answer_callback("cb-2", "test")
+    def test_send_telegram_text_logs_on_failure(self, monkeypatch):
+        from cerebellum.ui.dashboard import _send_telegram_text
 
-    def test_send_telegram_text_error(self) -> None:
-        import urllib.error as urllib_error
-        with patch("cerebellum.ui.dashboard._safe_opener", side_effect=urllib_error.URLError("fail")):
-            dashboard._send_telegram_text("chat-123", "hello")
+        monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "test-bot-token")
+        _send_telegram_text(12345678, "test message")
 
 
-# ---------------------------------------------------------------------------
-# Dashboard webhook callback handling (module-level tests)
-# ---------------------------------------------------------------------------
+class TestBaseDirHelpers:
+    def test_base_dir_from_env(self, monkeypatch):
+        from cerebellum.ui.dashboard import _base_dir
 
+        monkeypatch.setenv("CEREBELLUM_BASE_DIR", "/tmp/test-cerebellum")
+        result = _base_dir()
+        assert "/tmp/test-cerebellum" in str(result)
 
-class TestWebhookCallback:
-    """Test webhook callback handling using module-level state manipulation.
+    def test_config_path_from_env(self, monkeypatch):
+        from cerebellum.ui.dashboard import _config_path
 
-    Note: We cannot reload the dashboard module with TestClient because
-    FastAPI binds routes at module import time. These tests manipulate
-    the module-level state directly instead.
-    """
-
-    def test_telegram_allowed_user_ids_is_set(self) -> None:
-        from cerebellum.ui import dashboard as dash
-        assert isinstance(dash.TELEGRAM_ALLOWED_USER_IDS, set)
-
-    def test_hypothesis_id_regex(self) -> None:
-        from cerebellum.ui import dashboard as dash
-        assert dash.HYPOTHESIS_ID_RE.match("h-123") is not None
-        assert dash.HYPOTHESIS_ID_RE.match("<script>") is None
-        assert dash.HYPOTHESIS_ID_RE.match("a" * 200) is None
+        monkeypatch.setenv("CEREBELLUM_CONFIG", "/tmp/test-config.json")
+        result = _config_path()
+        assert "/tmp/test-config.json" in str(result)

@@ -117,7 +117,7 @@ ignore = [
 
 [tool.mypy]
 python_version = "3.11"
-strict = false
+strict = true
 warn_unreachable = true
 warn_redundant_casts = true
 warn_unused_ignores = true
@@ -125,34 +125,6 @@ disallow_untyped_decorators = true
 no_implicit_reexport = true
 show_error_codes = true
 pretty = true
-
-# Loosen for files still mid-rewrite. Tighten progressively per phase.
-# Phase 6 exit gate: this section is empty.
-[[tool.mypy.overrides]]
-module = [
-  "cerebellum.policy_arbiter",
-  "cerebellum.episode_store",
-  "cerebellum.proposer",
-  "cerebellum.migrations.*",
-  "cerebellum.observatory_main",
-  "cerebellum.ui.dashboard",
-  "cerebellum.ui.cortex_routes",
-  "cerebellum.event_bus",
-  "cerebellum.grounding",
-  "cerebellum.http_safe",
-  "cerebellum.instruments.*",
-  "cerebellum.feedback_loop",
-]
-disallow_untyped_defs = false
-disallow_incomplete_defs = false
-check_untyped_defs = false
-no_any_return = false
-no_untyped_calls = false
-warn_return_any = false
-warn_unreachable = false
-strict_optional = false
-disallow_subclassing_any = false
-warn_no_return = false
 
 # Third-party libs without type stubs
 [[tool.mypy.overrides]]
@@ -185,6 +157,8 @@ filterwarnings = [
   "ignore::DeprecationWarning",
   "ignore::DeprecationWarning:nats.*",
   "ignore::DeprecationWarning:kuzu.*",
+  "ignore::ResourceWarning:unclosed database",
+  "ignore::pytest.PytestUnraisableExceptionWarning",
 ]
 
 # ---------------------------------------------------------------------------
