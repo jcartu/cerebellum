@@ -11,6 +11,8 @@ import sqlite3
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -38,6 +40,18 @@ except ImportError:
 
 logger = logging.getLogger("cerebellum.dashboard")
 CONFIG_PATH = Path("/home/josh/.openclaw/cerebellum/config.json")
+
+
+class _NoRedirectHandler(urllib.request.HTTPErrorProcessor):
+    def http_response(self, request: urllib.request.Request, response: Any) -> Any:
+        if response.status in (301, 302, 303, 307, 308):
+            raise urllib.error.HTTPError(response.url, response.status, "Redirect forbidden", response.headers, None)
+        return response
+
+    https_response = http_response
+
+
+_safe_opener = urllib.request.build_opener(_NoRedirectHandler())
 
 # Lazy singleton — avoids module-level side effects
 _emitter: CerebellumEventEmitter | None = None
@@ -349,9 +363,7 @@ async def telegram_webhook(request: Request) -> JSONResponse:
                 (update_id, now_ts),
             )
             if cursor.rowcount == 0:
-                db.commit()
                 return JSONResponse({"ok": True, "message": "update already processed"})
-            db.commit()
             cursor.execute(
                 "DELETE FROM telegram_seen_updates WHERE seen_at < ?",
                 (now_ts - 86400,),
@@ -423,14 +435,13 @@ async def telegram_webhook(request: Request) -> JSONResponse:
 
 def _answer_callback(callback_id: str, text: str) -> None:
     try:
-        import urllib.request
         req = urllib.request.Request(
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery",
             data=json.dumps({"callback_query_id": callback_id, "text": text}).encode(),
             headers={"Content-Type": "application/json"},
             method="POST",
         )
-        with urllib.request.urlopen(req, timeout=10):
+        with _safe_opener.open(req, timeout=10):
             pass
     except Exception:
         logger.exception("Failed to answer callback %s", callback_id)
@@ -438,14 +449,13 @@ def _answer_callback(callback_id: str, text: str) -> None:
 
 def _send_telegram_text(chat_id: str | int, text: str) -> None:
     try:
-        import urllib.request
         req = urllib.request.Request(
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
             data=json.dumps({"chat_id": chat_id, "text": text}).encode(),
             headers={"Content-Type": "application/json"},
             method="POST",
         )
-        with urllib.request.urlopen(req, timeout=10):
+        with _safe_opener.open(req, timeout=10):
             pass
     except Exception:
         logger.exception("Failed to send Telegram message to %s", chat_id)

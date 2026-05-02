@@ -19,6 +19,18 @@ from typing import Any
 logger = logging.getLogger("cerebellum.hippocampus")
 
 
+class _NoRedirectHandler(urllib.request.HTTPErrorProcessor):
+    def http_response(self, request: urllib.request.Request, response: Any) -> Any:
+        if response.status in (301, 302, 303, 307, 308):
+            raise urllib.error.HTTPError(response.url, response.status, "Redirect forbidden", response.headers, None)
+        return response
+
+    https_response = http_response
+
+
+_safe_opener = urllib.request.build_opener(_NoRedirectHandler())
+
+
 @dataclass(slots=True)
 class LLMResponse:
     text: str
@@ -692,7 +704,7 @@ User request: {natural_language}
         )
 
         try:
-            with urllib.request.urlopen(request, timeout=60) as response:
+            with _safe_opener.open(request, timeout=60) as response:
                 response_payload = json.loads(response.read().decode("utf-8"))
         except (TimeoutError, urllib.error.URLError, urllib.error.HTTPError, json.JSONDecodeError) as exc:
             raise RuntimeError(f"OpenRouter request failed: {exc}") from exc
