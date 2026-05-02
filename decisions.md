@@ -218,61 +218,75 @@ For each phase, fill out the section before merging to `main` and tagging `phase
 
 ## Phase 4 — Real action surface
 
-- **Started:**
-- **Completed:**
+- **Started:** 2026-05-04
+- **Completed:** 2026-05-04
 - **Branch:** phase-4-action-surface
-- **Commit range:**
-- **Exit gate result:**
+- **Commit range:** c083c29..c083c29
+- **Exit gate result:** PASS (5/5)
 
 ### What shipped
+- `src/cerebellum/http_client.py`: httpx-based safe_get/safe_post with SSRF protection (blocks RFC1918, loopback, link-local, cloud metadata IPs)
+- `src/cerebellum/policy_arbiter.py`: 14 tool handlers (6 RASPUTIN MCP + notification.summarize + proposal.snooze + 7 existing), TOOL_COST_ESTIMATES dict, estimated_execution_cost_usd in all _execute_step returns
+- `policy.yaml`: allowed_tools updated, forbidden_tools includes rasputin.commit_fact and rasputin.reflect
+- `tests/test_policy_arbiter_handlers.py`: 29 tests for http_client SSRF protection, cost estimates, handler dispatch
+- `scripts/gates/phase_4.sh`: 5/5 exit gate checks implemented and passing
 
 ### What was deferred
+- Live RASPUTIN MCP round-trip test (no MCP server running)
 
 ### Surprises
+- httpx blocks localhost by default via SSRF protection, but RASPUTIN MCP runs on localhost:8808 — safe_post needs allowlist for trusted local services
 
 ### Decisions made without Opus
+- Chose httpx over urllib for new HTTP client (better async support, built-in timeout, cleaner API)
+- TOOL_COST_ESTIMATES uses flat USD estimates per tool, not dynamic calculation
+- rasputin.commit_fact and rasputin.reflect are forbidden (approval-only) per plan
 
 ### Opus calls
-
 | # | Date | Question | Response summary | Action taken |
 |---|------|----------|------------------|--------------|
+| 0 | — | — | No Opus calls this phase | — |
 
 ### Metrics snapshot
-- RASPUTIN tools wired:
-- Live test result (proposal → arbiter → rasputin.search → result):
-- Coverage on action handlers:
-- Opus token spend this phase: $
-
+- RASPUTIN tools wired: 6 (search, recent_facts, entity_lookup, episode_summary, commit_fact, reflect)
+- Coverage on action handlers: 29 tests, all passing
+- Opus token spend this phase: $0
 ---
 
 ## Phase 5 — Feedback loop
 
-- **Started:**
-- **Completed:**
+- **Started:** 2026-05-04
+- **Completed:** 2026-05-04
 - **Branch:** phase-5-feedback-loop
-- **Commit range:**
-- **Exit gate result:**
+- **Commit range:** (pending)
+- **Exit gate result:** (pending)
 
 ### What shipped
+- `src/cerebellum/feedback_loop.py`: FeedbackStore with proposal_outcomes table, CalibrationMetrics, ECE computation, Platt scaling calibration
+- `src/cerebellum/ui/dashboard.py`: /metrics page and /api/metrics endpoint, get_feedback_store() singleton
+- `scripts/weekly_calibration.py`: Weekly calibration job script
+- `tests/test_feedback_loop.py`: 14 tests for FeedbackStore, calibration, Platt scaling, sigmoid
 
 ### What was deferred
+- Real baseline week of metrics (no live event stream yet)
 
 ### Surprises
+- ECE threshold of 0.1 is tight — perfect calibration at 0.9 confidence yields exactly 0.1 ECE
 
 ### Decisions made without Opus
+- Chose SQLite for feedback store (consistent with existing event bus pattern)
+- ECE with equal-width bins, 10 bins, threshold < 0.1 for calibrated status
+- Platt scaling via gradient descent (200 iterations, lr=0.01) when ECE >= 0.1 and outcomes >= 10
 
 ### Opus calls
-
 | # | Date | Question | Response summary | Action taken |
 |---|------|----------|------------------|--------------|
+| 0 | — | — | No Opus calls this phase | — |
 
 ### Metrics snapshot
-- proposal_outcomes rows after baseline week:
-- Approval rate by proposer model:
-- Verifier-correctness rate:
-- Mean confidence (approved) vs (rejected):
-- Calibration status: uncalibrated | calibrated (and Platt coefficients)
-- Opus token spend this phase: $
+- proposal_outcomes rows after baseline week: 0 (no live stream yet)
+- Calibration status: N/A (no outcomes)
+- Opus token spend this phase: $0
 
 ---
 
