@@ -73,7 +73,7 @@ class DailyCostTracker:
 
     def __init__(self, max_cost: float):
         self.max_cost = max_cost
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._day = datetime.now(timezone.utc).date()
         self._spent = 0.0
 
@@ -148,6 +148,9 @@ class _PinnedHTTPSHandler(urllib.request.HTTPSHandler):
         )
 
 
+_safe_opener = urllib.request.build_opener(_NoRedirectHandler())
+
+
 class BasalGanglia:
     """Action arbiter - decides what to do with hypotheses."""
 
@@ -163,7 +166,7 @@ class BasalGanglia:
         self.kill_switch_file = self.state_dir / "kill_switch.flag"
         self.emitter = emitter
         self.cortex = cortex
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
 
         try:
             self.policy = yaml.safe_load(self.config_path.read_text(encoding="utf-8")) or {}
@@ -717,7 +720,7 @@ class BasalGanglia:
             },
         )
         MAX_RESPONSE_BYTES = 2 * 1024 * 1024  # 2 MiB
-        with urllib.request.urlopen(request, timeout=30) as response:
+        with _safe_opener.open(request, timeout=30) as response:
             raw = response.read(MAX_RESPONSE_BYTES + 1)
         if len(raw) > MAX_RESPONSE_BYTES:
             raise RuntimeError("web.search response exceeded 2 MiB cap")
@@ -756,7 +759,7 @@ class BasalGanglia:
             headers={"Content-Type": "application/json"},
         )
         MAX_RESPONSE_BYTES = 4 * 1024 * 1024
-        with urllib.request.urlopen(request, timeout=30) as response:
+        with _safe_opener.open(request, timeout=30) as response:
             raw = response.read(MAX_RESPONSE_BYTES + 1)
         if len(raw) > MAX_RESPONSE_BYTES:
             raise RuntimeError("memory.query response exceeded 4 MiB cap")
@@ -786,7 +789,7 @@ class BasalGanglia:
             },
         )
         MAX_RESPONSE_BYTES = 8 * 1024 * 1024
-        with urllib.request.urlopen(request, timeout=60) as response:
+        with _safe_opener.open(request, timeout=60) as response:
             raw = response.read(MAX_RESPONSE_BYTES + 1)
         if len(raw) > MAX_RESPONSE_BYTES:
             raise RuntimeError("model.call response exceeded 8 MiB cap")
@@ -829,7 +832,7 @@ class BasalGanglia:
         )
         MAX_TELEGRAM_RESPONSE_BYTES = 256 * 1024  # 256 KiB
         try:
-            with urllib.request.urlopen(request, timeout=30) as response:
+            with _safe_opener.open(request, timeout=30) as response:
                 raw = response.read(MAX_TELEGRAM_RESPONSE_BYTES + 1)
             if len(raw) > MAX_TELEGRAM_RESPONSE_BYTES:
                 raise RuntimeError("Telegram response exceeded 256 KiB cap")

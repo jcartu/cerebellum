@@ -8,6 +8,7 @@ import logging
 import os
 import re
 import sqlite3
+import sys
 import threading
 import time
 from collections import Counter
@@ -70,6 +71,9 @@ def get_arbiter() -> BasalGanglia | None:
 
 app = FastAPI(title="Cerebellum Observatory")
 DASHBOARD_TOKEN = os.environ.get("DASHBOARD_TOKEN", "")
+if not DASHBOARD_TOKEN:
+    logger.error("DASHBOARD_TOKEN environment variable is required")
+    sys.exit(1)
 _dashboard_db: sqlite3.Connection | None = None
 _dashboard_db_lock = threading.RLock()
 
