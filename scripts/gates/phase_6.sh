@@ -10,13 +10,13 @@ export TELEGRAM_WEBHOOK_SECRET="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 export TELEGRAM_ALLOWED_USER_IDS="12345678"
 PASS=0
 FAIL=0
-TOTAL=14
+TOTAL=15
 
-echo "=== Phase 6 Redo Exit Gate (14 checks) ==="
+echo "=== Phase 6 Redo Exit Gate (15 checks) ==="
 echo ""
 
 # 1. All tests pass
-echo "[1/14] Running test suite…"
+echo "[1/15] Running test suite…"
 if .venv/bin/python -m pytest tests/ -q --tb=short > /tmp/phase6_tests.log 2>&1; then
     echo "  [PASS] All tests pass"
     PASS=$((PASS + 1))
@@ -26,7 +26,7 @@ else
 fi
 
 # 2. Global coverage ≥ 80%
-echo "[2/14] Checking global coverage…"
+echo "[2/15] Checking global coverage…"
 COVERAGE_OUTPUT=$(.venv/bin/python -m pytest tests/ --cov=cerebellum --cov-report=term -q 2>&1 || true)
 GLOBAL_COV=$(echo "$COVERAGE_OUTPUT" | grep "^TOTAL" | awk '{print $6}' | tr -d '%')
 if [ "${GLOBAL_COV:-0}" -ge 80 ]; then
@@ -58,7 +58,7 @@ else
 fi
 
 # 5. Property tests green
-echo "[5/14] Running property tests…"
+echo "[5/15] Running property tests…"
 if .venv/bin/python -m pytest tests/test_property_tests.py -q --tb=short --override-ini="addopts=" > /dev/null 2>&1; then
     echo "  [PASS] Property tests green"
     PASS=$((PASS + 1))
@@ -68,7 +68,7 @@ else
 fi
 
 # 6. Property tests reproducible with seed
-echo "[6/14] Checking property test reproducibility…"
+echo "[6/15] Checking property test reproducibility…"
 SEED=$(.venv/bin/python -c "import random; print(random.randint(1, 100000))")
 if .venv/bin/python -m pytest tests/test_property_tests.py -q --tb=short --hypothesis-seed="$SEED" --override-ini="addopts=" > /dev/null 2>&1; then
     echo "  [PASS] Property tests reproducible with seed $SEED"
@@ -79,7 +79,7 @@ else
 fi
 
 # 7. Fuzzer green
-echo "[7/14] Running fuzzer…"
+echo "[7/15] Running fuzzer…"
 if .venv/bin/python -m pytest tests/test_telegram_fuzzer.py -q --tb=short --override-ini="addopts=" > /dev/null 2>&1; then
     echo "  [PASS] Fuzzer green"
     PASS=$((PASS + 1))
@@ -89,7 +89,7 @@ else
 fi
 
 # 8. ruff lint clean
-echo "[8/14] Running ruff lint…"
+echo "[8/15] Running ruff lint…"
 if .venv/bin/ruff check src/cerebellum tests/ > /dev/null 2>&1; then
     echo "  [PASS] ruff lint clean"
     PASS=$((PASS + 1))
@@ -99,7 +99,7 @@ else
 fi
 
 # 9. mypy strict clean
-echo "[9/14] Running mypy strict…"
+echo "[9/15] Running mypy strict…"
 if .venv/bin/python -m mypy src/cerebellum > /dev/null 2>&1; then
     echo "  [PASS] mypy strict clean"
     PASS=$((PASS + 1))
@@ -109,7 +109,7 @@ else
 fi
 
 # 10. decisions.md contains Phase 6 entry
-echo "[10/14] Checking decisions.md…"
+echo "[10/15] Checking decisions.md…"
 if grep -q "## Phase 6" decisions.md 2>/dev/null; then
     echo "  [PASS] decisions.md contains Phase 6 entry"
     PASS=$((PASS + 1))
@@ -119,7 +119,7 @@ else
 fi
 
 # 11. README exists and mentions key components
-echo "[11/14] Checking README accuracy…"
+echo "[11/15] Checking README accuracy…"
 if [ -f README.md ] && grep -q "EventBus" README.md && grep -q "PolicyArbiter" README.md && grep -q "SSRF" README.md; then
     echo "  [PASS] README contains key component descriptions"
     PASS=$((PASS + 1))
@@ -129,7 +129,7 @@ else
 fi
 
 # 12. SECURITY.md exists and covers key topics
-echo "[12/14] Checking SECURITY.md…"
+echo "[12/15] Checking SECURITY.md…"
 if [ -f SECURITY.md ] && grep -q "NATS" SECURITY.md; then
     echo "  [PASS] SECURITY.md exists and covers NATS"
     PASS=$((PASS + 1))
@@ -139,7 +139,7 @@ else
 fi
 
 # 13. Cypher filter tests pass (regression)
-echo "[13/14] Running cypher filter regression tests…"
+echo "[13/15] Running cypher filter regression tests…"
 if .venv/bin/python -m pytest tests/test_cypher_filter.py -q --tb=short --override-ini="addopts=" > /dev/null 2>&1; then
     echo "  [PASS] Cypher filter regression tests pass"
     PASS=$((PASS + 1))
@@ -149,12 +149,27 @@ else
 fi
 
 # 14. Opus audit review completed (manual check via decisions.md)
-echo "[14/14] Checking Opus audit completion…"
+echo "[14/15] Checking Opus audit completion…"
 if grep -q "Opus" decisions.md 2>/dev/null && grep -q "Phase 6" decisions.md 2>/dev/null; then
     echo "  [PASS] Opus audit review recorded in decisions.md"
     PASS=$((PASS + 1))
 else
     echo "  [FAIL] Opus audit review not recorded in decisions.md"
+    FAIL=$((FAIL + 1))
+fi
+
+# 15. urllib migration complete
+echo "[15/15] Checking urllib migration is complete…"
+URLLIB_MATCHES=$(grep -rn --include="*.py" "urllib.request" src/ \
+  | grep -v "src/cerebellum/http_safe.py" \
+  | grep -v "src/cerebellum/http_client.py" \
+  | wc -l || true)
+if [ "${URLLIB_MATCHES:-0}" -eq 0 ]; then
+    echo "  [PASS] No urllib.request callers outside http_safe.py and http_client.py"
+    PASS=$((PASS + 1))
+else
+    echo "  [FAIL] $URLLIB_MATCHES urllib.request callers remain in src/"
+    grep -rn "urllib.request" src/ | grep -v "http_safe.py" | grep -v "http_client.py" | grep -v "__pycache__" | head -10
     FAIL=$((FAIL + 1))
 fi
 
@@ -171,5 +186,5 @@ if [ "$FAIL" -gt 0 ]; then
 fi
 
 echo ""
-echo "Phase 6 Redo exit gate PASSED — all 14 checks green."
+echo "Phase 6 Redo exit gate PASSED — all 15 checks green."
 exit 0
