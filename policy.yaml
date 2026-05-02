@@ -13,8 +13,7 @@ auto_execute:
   max_cost: 0.3
   required_reversibility: ["full", "partial"]
   allowed_tools:
-    - "browser.screenshot"
-    - "browser.navigate"
+    - "http.get"
     - "web.search"
     - "file.read"
     - "memory.query"

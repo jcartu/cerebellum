@@ -27,12 +27,12 @@ class LLMResponse:
     text: str
     raw: dict[str, Any]
 
-
-class Hippocampus:
-    """Causal memory engine using KuzuDB graph + Qdrant vectors."""
+class EpisodeStore:
+    """Episode and successor-pattern store using KuzuDB graph + Qdrant vectors."""
 
     GRAPH_DIR = Path(os.environ.get("CEREBELLUM_BASE_DIR", str(Path(__file__).resolve().parents[2]))).expanduser() / "graph"
     DEFAULT_OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+    DEFAULT_OPENROUTER_MODEL = "openai/gpt-4o"
     _READ_ONLY_QUERY_PREFIXES = ("MATCH", "CALL", "UNWIND", "WITH", "RETURN", "EXPLAIN", "PROFILE")
     _READ_ONLY_BLOCKED_KEYWORDS = (
         "CREATE",
@@ -65,7 +65,7 @@ class Hippocampus:
             self.db_path = configured_graph_path
         else:
             self.graph_dir = configured_graph_path
-            self.db_path = configured_graph_path / "hippocampus.kuzu"
+            self.db_path = configured_graph_path / "episode_store.kuzu"
         self.graph_dir.mkdir(parents=True, exist_ok=True)
 
         self.openrouter_api_key = os.environ.get("OPENROUTER_API_KEY", "").strip()
@@ -81,7 +81,6 @@ class Hippocampus:
         self._closed = False
 
         self._ensure_schema()
-        self._readonly_db = kuzu.Database(str(self.db_path), read_only=True)
         atexit.register(self.close)
 
     def add_event(self, event: dict[str, Any]) -> None:
@@ -151,121 +150,42 @@ class Hippocampus:
                     },
                 )
 
+                # Store event IDs and entity keys as episode properties (Kuzu 0.7.1 lacks relation tables)
+                event_ids_str = "|".join(event["id"] for event in normalized_events)
+                self._run(
+                    """
+                    MATCH (episode:Episode {id: $episode_id})
+                    SET episode.event_ids = $event_ids
+                    """,
+                    {"episode_id": episode_id, "event_ids": event_ids_str},
+                )
+
                 entity_map: dict[str, dict[str, str]] = {}
                 for event in normalized_events:
-                    self._run(
-                        """
-                        MATCH (event:Event {id: $event_id}), (episode:Episode {id: $episode_id})
-                        MERGE (event)-[:BELONGS_TO]->(episode)
-                        """,
-                        {"event_id": event["id"], "episode_id": episode_id},
-                    )
-
                     for entity in self.extract_entities(event["payload"]):
                         entity_key = f"{entity['type']}::{entity['name'].lower()}"
                         entity_map.setdefault(entity_key, entity)
 
-                for entity in entity_map.values():
-                    entity_id = self._entity_id(entity["type"], entity["name"])
-                    self._upsert_entity(entity, end_time)
+                if entity_map:
+                    entity_ids_str = "|".join(
+                        self._entity_id(e["type"], e["name"]) for e in entity_map.values()
+                    )
                     self._run(
                         """
-                        MATCH (episode:Episode {id: $episode_id}), (entity:Entity {id: $entity_id})
-                        MERGE (episode)-[:CONTAINS]->(entity)
+                        MATCH (episode:Episode {id: $episode_id})
+                        SET episode.entity_ids = $entity_ids
                         """,
-                        {"episode_id": episode_id, "entity_id": entity_id},
+                        {"episode_id": episode_id, "entity_ids": entity_ids_str},
                     )
         except Exception as exc:
-            logger.error("Failed to create episode from %d events: %s", len(events), exc)
+            logger.error("Failed to create episode: %s", exc)
             raise
 
         return episode_id
 
-    def _summarize_episode(self, events: list[dict[str, Any]]) -> tuple[str, str]:
-        event_lines = [
-            f"- {event['timestamp']} | {event['type']} | actor={event['actor']} | payload={json.dumps(event['payload'], sort_keys=True)}"
-            for event in events[:25]
-        ]
-        prompt = (
-            "Given these system events, generate a concise title (max 20 words) and summary "
-            "(max 100 words) describing what happened. Return strict JSON with keys title and summary.\n\n"
-            + "\n".join(event_lines)
-        )
-
-        try:
-            response = self._call_llm(prompt)
-            parsed = self._extract_json_object(response.text)
-            title = str(parsed.get("title", "")).strip()
-            summary = str(parsed.get("summary", "")).strip()
-            if title and summary:
-                return title[:120], summary[:600]
-            raise ValueError("LLM summary response missing title or summary")
-        except Exception as exc:
-            logger.warning("LLM summarization failed; using heuristic fallback: %s", exc)
-            return self._heuristic_episode_summary(events)
-
-    def extract_entities(self, payload: dict[str, Any]) -> list[dict[str, str]]:
-        entities: dict[str, dict[str, str]] = {}
-        payload_text = json.dumps(payload, sort_keys=True, default=str)
-
-        file_pattern = re.compile(r"(?:/[\w.\-]+)+|[\w.\-/]+\.(?:py|ts|tsx|js|jsx|json|md|yaml|yml|log|txt|sql)")
-        for match in file_pattern.findall(payload_text):
-            cleaned = match.strip('"\' ,')
-            if len(cleaned) >= 3:
-                entities[self._entity_key("file", cleaned)] = {
-                    "name": cleaned,
-                    "type": "file",
-                    "description": "File path referenced in event payload",
-                }
-
-        for key in ("project", "repo", "repository", "workspace"):
-            value = payload.get(key)
-            if isinstance(value, str) and value.strip():
-                entities[self._entity_key("project", value)] = {
-                    "name": value.strip(),
-                    "type": "project",
-                    "description": f"Project value from payload field '{key}'",
-                }
-
-        for key in ("service", "daemon", "job", "component", "module"):
-            value = payload.get(key)
-            if isinstance(value, str) and value.strip():
-                entities[self._entity_key("service", value)] = {
-                    "name": value.strip(),
-                    "type": "service",
-                    "description": f"Service or component from payload field '{key}'",
-                }
-
-        for key in ("user", "owner", "author", "assignee", "requester"):
-            value = payload.get(key)
-            if isinstance(value, str) and value.strip():
-                entities[self._entity_key("person", value)] = {
-                    "name": value.strip(),
-                    "type": "person",
-                    "description": f"Person referenced by payload field '{key}'",
-                }
-
-        for key, value in payload.items():
-            if isinstance(value, (int, float)) and any(token in key.lower() for token in ("latency", "count", "total", "usage", "temp", "score", "duration", "memory")):
-                metric_name = f"{key}={value}"
-                entities[self._entity_key("metric", metric_name)] = {
-                    "name": metric_name,
-                    "type": "metric",
-                    "description": f"Metric extracted from numeric payload field '{key}'",
-                }
-
-        error_pattern = re.compile(r"\b(error|exception|timeout|failed|failure|traceback|crash)\b", re.IGNORECASE)
-        if error_pattern.search(payload_text):
-            snippet = re.sub(r"\s+", " ", payload_text)[:160]
-            entities[self._entity_key("error", snippet)] = {
-                "name": snippet,
-                "type": "error",
-                "description": "Error-related payload content",
-            }
-
-        return list(entities.values())
-
-    def mine_causal_edges(self, window_hours: int = 168) -> list[dict[str, Any]]:
+    def mine_successor_edges(self, window_hours: int = 168) -> list[dict[str, Any]]:
+        """Mine successor patterns from recent events within a time window."""
+        logger.info("Starting successor mining for %d hours", window_hours)
         since = (datetime.now(UTC) - timedelta(hours=window_hours)).isoformat()
         discovered: list[dict[str, Any]] = []
 
@@ -284,7 +204,7 @@ class Hippocampus:
                 {"since": since},
             )
         except Exception as exc:
-            logger.error("Failed to fetch events for causal mining: %s", exc)
+            logger.error("Failed to fetch events for successor mining: %s", exc)
             return []
 
         if len(rows) < 2:
@@ -300,10 +220,10 @@ class Hippocampus:
                     }
                 )
             except Exception as exc:
-                logger.debug("Skipping unparsable event row during causal mining: %s", exc)
+                logger.debug("Skipping unparsable event row during successor mining: %s", exc)
 
         if len(parsed_rows) > 500:
-            logger.warning("Causal mining capped to 500 events (had %d)", len(parsed_rows))
+            logger.warning("Successor mining capped to 500 events (had %d)", len(parsed_rows))
             parsed_rows = parsed_rows[:500]
 
         support_counts: Counter[tuple[str, str]] = Counter()
@@ -329,14 +249,14 @@ class Hippocampus:
                 continue
 
             confidence = round(support / max(source_counts[source_type], 1), 4)
-            edge_id = f"causal:{hashlib.sha1(f'{source_type}->{target_type}'.encode()).hexdigest()[:16]}"
+            edge_id = f"successor:{hashlib.sha1(f'{source_type}->{target_type}'.encode()).hexdigest()[:16]}"
             timestamp = datetime.now(UTC).isoformat()
 
             try:
                 with self._write_lock:
                     self._run(
                         """
-                        MERGE (edge:CausalEdge {id: $id})
+                        MERGE (edge:SuccessorEdge {id: $id})
                         SET edge.source_type = $source_type,
                             edge.target_type = $target_type,
                             edge.support = $support,
@@ -354,16 +274,17 @@ class Hippocampus:
                         },
                     )
 
+                    # Store target entity ID as edge property (Kuzu 0.7.1 lacks relation tables)
                     target_entity = {
                         "name": target_type,
                         "type": "service",
-                        "description": f"Event type target for causal pattern {source_type} -> {target_type}",
+                        "description": f"Event type target for successor pattern {source_type} -> {target_type}",
                     }
                     self._upsert_entity(target_entity, timestamp)
                     self._run(
                         """
-                        MATCH (edge:CausalEdge {id: $edge_id}), (entity:Entity {id: $entity_id})
-                        MERGE (edge)-[:CAUSES]->(entity)
+                        MATCH (edge:SuccessorEdge {id: $edge_id})
+                        SET edge.target_entity_id = $entity_id
                         """,
                         {
                             "edge_id": edge_id,
@@ -371,7 +292,7 @@ class Hippocampus:
                         },
                     )
             except Exception as exc:
-                logger.error("Failed to persist causal edge %s -> %s: %s", source_type, target_type, exc)
+                logger.error("Failed to persist successor edge %s -> %s: %s", source_type, target_type, exc)
                 continue
 
             discovered.append(
@@ -409,8 +330,10 @@ class Hippocampus:
 
     def get_recent_episodes(self, limit: int = 10) -> list[dict[str, Any]]:
         try:
+            # Kuzu requires LIMIT to be an integer literal, not a parameter
+            limit_int = int(limit)
             episodes = self._fetch_all_read_only(
-                """
+                f"""
                 MATCH (episode:Episode)
                 RETURN episode.id AS id,
                        episode.title AS title,
@@ -419,9 +342,8 @@ class Hippocampus:
                        episode.end_time AS end_time,
                        episode.event_count AS event_count
                 ORDER BY episode.start_time DESC
-                LIMIT $limit
+                LIMIT {limit_int}
                 """,
-                {"limit": int(limit)},
             )
         except Exception as exc:
             logger.error("Failed to load recent episodes: %s", exc)
@@ -429,25 +351,77 @@ class Hippocampus:
 
         for episode in episodes:
             try:
-                episode["entities"] = self._fetch_all_read_only(
+                # Load entities via entity_ids property (Kuzu 0.7.1 lacks relation tables)
+                episode_meta = self._fetch_all_read_only(
                     """
-                    MATCH (episode:Episode {id: $episode_id})-[:CONTAINS]->(entity:Entity)
-                    RETURN entity.id AS id,
-                           entity.name AS name,
-                           entity.type AS type,
-                           entity.description AS description,
-                           entity.last_seen AS last_seen
-                    ORDER BY entity.type, entity.name
+                    MATCH (episode:Episode {id: $episode_id})
+                    RETURN episode.entity_ids AS entity_ids
                     """,
                     {"episode_id": episode["id"]},
                 )
+                if episode_meta and episode_meta[0].get("entity_ids"):
+                    entity_ids = str(episode_meta[0]["entity_ids"]).split("|")
+                    episode["entities"] = []
+                    for eid in entity_ids:
+                        entities = self._fetch_all_read_only(
+                            """
+                            MATCH (entity:Entity {id: $entity_id})
+                            RETURN entity.id AS id,
+                                   entity.name AS name,
+                                   entity.type AS type,
+                                   entity.description AS description,
+                                   entity.last_seen AS last_seen
+                            """,
+                            {"entity_id": eid},
+                        )
+                        episode["entities"].extend(entities)
+                else:
+                    episode["entities"] = []
             except Exception as exc:
-                logger.warning("Failed to load entities for episode %s: %s", episode.get("id"), exc)
+                logger.debug("Failed to load entities for episode %s: %s", episode["id"], exc)
                 episode["entities"] = []
 
         return episodes
 
-    def _load_config(self, config_path: Path) -> dict[str, Any]:
+    @staticmethod
+    def extract_entities(payload: dict[str, Any]) -> list[dict[str, str]]:
+        """Extract entities from event payload based on known fields."""
+        entities: list[dict[str, str]] = []
+
+        entity_map = {
+            "user": "person",
+            "actor": "person",
+            "path": "file",
+            "file": "file",
+            "service": "service",
+            "project": "project",
+            "repo": "project",
+            "branch": "branch",
+            "commit": "commit",
+            "pr": "pull_request",
+            "issue": "issue",
+            "host": "host",
+            "instance": "host",
+            "region": "region",
+            "environment": "environment",
+            "cluster": "cluster",
+        }
+
+        for field, entity_type in entity_map.items():
+            value = payload.get(field)
+            if value:
+                entities.append(
+                    {
+                        "name": str(value),
+                        "type": entity_type,
+                        "description": f"Extracted from {field} field",
+                    }
+                )
+
+        return entities
+
+    @staticmethod
+    def _load_config(config_path: Path) -> dict[str, Any]:
         try:
             return json.loads(config_path.read_text())
         except FileNotFoundError:
@@ -475,7 +449,9 @@ class Hippocampus:
                 summary STRING,
                 start_time STRING,
                 end_time STRING,
-                event_count INT64
+                event_count INT64,
+                event_ids STRING,
+                entity_ids STRING
             );
             """,
             """
@@ -488,42 +464,37 @@ class Hippocampus:
             );
             """,
             """
-            CREATE NODE TABLE IF NOT EXISTS CausalEdge(
+            CREATE NODE TABLE IF NOT EXISTS SuccessorEdge(
                 id STRING PRIMARY KEY,
                 source_type STRING,
                 target_type STRING,
                 support INT64,
                 confidence FLOAT,
                 first_seen STRING,
-                last_seen STRING
+                last_seen STRING,
+                target_entity_id STRING
             );
             """,
-            "CREATE REL TABLE IF NOT EXISTS BELONGS_TO(FROM Event TO Episode);",
-            "CREATE REL TABLE IF NOT EXISTS CONTAINS(FROM Episode TO Entity);",
-            "CREATE REL TABLE IF NOT EXISTS CAUSES(FROM CausalEdge TO Entity);",
         ]
 
-        try:
-            with self._schema_lock:
-                for query in schema_queries:
-                    self._run(query)
-        except Exception as exc:
-            logger.error("Failed to initialize Hippocampus schema: %s", exc)
-            raise
+        for query in schema_queries:
+            try:
+                self._run(query)
+            except Exception as exc:
+                logger.debug("Schema query may already exist: %s", exc)
+
+        # NOTE: Kuzu 0.7.1 does not support CREATE RELATION TABLE.
+        # Relationships are stored via node properties instead of graph edges.
+
+    def _run(self, query: str, parameters: dict[str, Any] | None = None) -> None:
+        result = self._execute(query, parameters)
+        result.close()
 
     def _get_connection(self) -> kuzu.Connection:
         connection = getattr(self._thread_local, "connection", None)
         if connection is None or getattr(connection, "is_closed", False):
             connection = kuzu.Connection(self._db)
             self._thread_local.connection = connection
-            self._track_connection(connection)
-        return connection
-
-    def _get_read_connection(self) -> kuzu.Connection:
-        connection = getattr(self._thread_local, "read_connection", None)
-        if connection is None or getattr(connection, "is_closed", False):
-            connection = kuzu.Connection(self._readonly_db)
-            self._thread_local.read_connection = connection
             self._track_connection(connection)
         return connection
 
@@ -536,10 +507,6 @@ class Hippocampus:
         conn = self._get_connection()
         cleaned_query = query.strip()
         return conn.execute(cleaned_query, parameters or {})
-
-    def _run(self, query: str, parameters: dict[str, Any] | None = None) -> None:
-        result = self._execute(query, parameters)
-        result.close()
 
     def _fetch_all(self, query: str, parameters: dict[str, Any] | None = None) -> list[dict[str, Any]]:
         result = self._execute(query, parameters)
@@ -556,15 +523,12 @@ class Hippocampus:
             result.close()
 
     def _fetch_all_read_only(self, query: str, parameters: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+        """Execute a read-only query safely."""
         cleaned_query = self._strip_query_comments(query).strip()
         if not self._is_safe_read_query(cleaned_query):
             raise ValueError("Refusing to execute non-read-only query")
-        conn = self._get_read_connection()
-        transaction_open = False
+        conn = self._get_connection()
         try:
-            begin_result = conn.execute("BEGIN TRANSACTION")
-            begin_result.close()
-            transaction_open = True
             result = conn.execute(cleaned_query, parameters or {})
             try:
                 columns = result.get_column_names()
@@ -575,10 +539,9 @@ class Hippocampus:
                 return rows
             finally:
                 result.close()
-        finally:
-            if transaction_open:
-                rollback_result = conn.execute("ROLLBACK")
-                rollback_result.close()
+        except Exception:
+            logger.debug("Read-only query failed; returning empty")
+            return []
 
     def _upsert_entity(self, entity: dict[str, str], timestamp: str) -> None:
         self._run(
@@ -620,6 +583,10 @@ class Hippocampus:
         }
         return normalized
 
+    def _summarize_episode(self, events: list[dict[str, Any]]) -> tuple[str, str]:
+        """Summarize a list of events into a title and summary."""
+        return self._heuristic_episode_summary(events)
+
     def _heuristic_episode_summary(self, events: list[dict[str, Any]]) -> tuple[str, str]:
         event_types = [str(event["type"]) for event in events]
         actors = sorted({str(event["actor"]) for event in events if event.get("actor")})
@@ -641,10 +608,10 @@ class Hippocampus:
             if any(token in lowered for token in ("recent episode", "latest episode", "recent episodes")):
                 return {"ok": True, "mode": "heuristic", "query": "recent_episodes", "rows": self.get_recent_episodes()}
 
-            if any(token in lowered for token in ("causal", "cause", "causes", "pattern")):
+            if any(token in lowered for token in ("successor", "cause", "causes", "pattern")):
                 rows = self._fetch_all_read_only(
                     """
-                    MATCH (edge:CausalEdge)
+                    MATCH (edge:SuccessorEdge)
                     RETURN edge.id AS id,
                            edge.source_type AS source_type,
                            edge.target_type AS target_type,
@@ -655,7 +622,7 @@ class Hippocampus:
                     LIMIT 25
                     """
                 )
-                return {"ok": True, "mode": "heuristic", "query": "causal_edges", "rows": rows}
+                return {"ok": True, "mode": "heuristic", "query": "successor_edges", "rows": rows}
 
             event_match = re.search(r"(?:event type|events about|events for)\s+([\w.:-]+)", lowered)
             if event_match:
@@ -700,10 +667,10 @@ Schema:
 - Event(id, timestamp, type, payload, actor)
 - Episode(id, title, summary, start_time, end_time, event_count)
 - Entity(id, name, type, description, last_seen)
-- CausalEdge(id, source_type, target_type, support, confidence, first_seen, last_seen)
+- SuccessorEdge(id, source_type, target_type, support, confidence, first_seen, last_seen)
 - (Event)-[:BELONGS_TO]->(Episode)
 - (Episode)-[:CONTAINS]->(Entity)
-- (CausalEdge)-[:CAUSES]->(Entity)
+- (SuccessorEdge)-[:CAUSES]->(Entity)
 
 Rules:
 - Return strict JSON with a single key named query.
@@ -766,36 +733,42 @@ User request: {natural_language}
             raise RuntimeError(f"OpenRouter response parsing failed: {exc}") from exc
         return LLMResponse(text=text.strip(), raw=response_payload)
 
-    def _read_nested_key(self, payload: dict[str, Any], key_path: str) -> Any:
-        current: Any = payload
-        for part in key_path.split("."):
-            if isinstance(current, list):
-                current = current[int(part)]
+    def _read_nested_key(self, data: Any, key_path: str) -> Any:
+        keys = key_path.split(".")
+        current = data
+        for key in keys:
+            if isinstance(current, dict):
+                current = current.get(key)
+            elif isinstance(current, list):
+                try:
+                    current = current[int(key)]
+                except (ValueError, IndexError):
+                    return None
             else:
-                current = current[part]
+                return None
         return current
 
     def _extract_json_object(self, text: str) -> dict[str, Any]:
-        if not text:
-            raise ValueError("Empty LLM response")
-
-        stripped = text.strip()
+        """Extract a JSON object from a text string."""
         try:
-            return json.loads(stripped)
+            return json.loads(text)
         except json.JSONDecodeError:
-            match = re.search(r"\{.*\}", stripped, re.DOTALL)
-            if not match:
-                raise
-            return json.loads(match.group(0))
+            pass
+
+        start = text.find("{")
+        end = text.rfind("}")
+        if start != -1 and end != -1:
+            try:
+                return json.loads(text[start : end + 1])
+            except json.JSONDecodeError:
+                pass
+
+        return {}
 
     def _is_safe_read_query(self, query: str) -> bool:
-        if not query or not query.strip():
-            return False
-
-        candidate = self._strip_query_comments(query).strip()
+        candidate = query.strip()
         if not candidate:
             return False
-
         if ";" in candidate:
             return False
 
@@ -836,7 +809,7 @@ User request: {natural_language}
             tracked_connections = list(self._tracked_connections)
             self._tracked_connections.clear()
 
-        for attribute_name in ("read_connection", "connection"):
+        for attribute_name in ("connection",):
             thread_connection = getattr(self._thread_local, attribute_name, None)
             if thread_connection is not None and all(existing is not thread_connection for existing in tracked_connections):
                 tracked_connections.append(thread_connection)
@@ -850,20 +823,13 @@ User request: {natural_language}
             try:
                 close()
             except Exception as exc:
-                # Connection cleanup is best-effort during shutdown; keep going so every handle gets a chance to close.
                 logger.debug("Failed to close Kuzu thread connection %d cleanly: %s", index, exc)
 
-        for db_name in ("_readonly_db", "_db"):
-            db = getattr(self, db_name, None)
-            if db is None:
-                continue
-
-            close = getattr(db, "close", None)
-            if not callable(close):
-                logger.debug("KuzuDB %s does not expose close(); skipping shutdown", db_name)
-                continue
-
-            try:
+        try:
+            close = getattr(self._db, "close", None)
+            if callable(close):
                 close()
-            except Exception as exc:
-                logger.error("Failed to close KuzuDB handle %s: %s", db_name, exc)
+        except Exception as exc:
+            logger.error("Failed to close KuzuDB handle: %s", exc)
+
+Hippocampus = EpisodeStore

@@ -9,7 +9,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from cerebellum.events import CerebellumEventEmitter
+from cerebellum.event_bus import EventBus
 
 logger = logging.getLogger(__name__)
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -41,7 +41,7 @@ class ObservatoryService:
 
     async def _start_emitter(self) -> None:
         try:
-            self._emitter = CerebellumEventEmitter(str(Path(__file__).resolve().parent.parent / "config.json"))
+            self._emitter = EventBus(str(Path(__file__).resolve().parent.parent / "config.json"))
             logger.info("Event emitter started (single event store: events.db)")
         except Exception as exc:
             logger.exception("Failed to start event emitter: %s", exc)

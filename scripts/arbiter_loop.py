@@ -13,7 +13,7 @@ from typing import Any
 BASE_DIR = Path(__file__).resolve().parent
 SRC_DIR = BASE_DIR / "src" / "cerebellum"
 
-from cerebellum.arbiter import BasalGanglia
+from cerebellum.policy_arbiter import PolicyArbiter
 
 logger = logging.getLogger(__name__)
 STOP_REQUESTED = False
@@ -60,22 +60,22 @@ def _load_loop_config() -> dict[str, Any]:
     return {}
 
 
-def _load_cortex() -> Any:
-    cortex_path = SRC_DIR / "cortex.py"
-    module = _load_module(cortex_path, "cerebellum_cortex")
+def _load_proposer() -> Any:
+    proposer_path = SRC_DIR / "proposer.py"
+    module = _load_module(proposer_path, "cerebellum_proposer")
     if module is None:
-        logger.warning("cortex.py unavailable; using fallback queue only")
+        logger.warning("proposer.py unavailable; using fallback queue only")
         return None
 
-    cortex_cls = getattr(module, "PrefrontalCortex", None)
-    if cortex_cls is None:
-        logger.warning("PrefrontalCortex not found in %s", cortex_path)
+    proposer_cls = getattr(module, "Proposer", None)
+    if proposer_cls is None:
+        logger.warning("Proposer not found in %s", proposer_path)
         return None
 
     try:
-        return cortex_cls(str(BASE_DIR / "config.json"))
+        return proposer_cls(str(BASE_DIR / "config.json"))
     except Exception:
-        logger.exception("Failed to instantiate PrefrontalCortex from %s", cortex_path)
+        logger.exception("Failed to instantiate Proposer from %s", proposer_path)
         return None
 
 
@@ -118,14 +118,14 @@ def _invoke_hypothesis_method(method_name: str, method: Any) -> list[dict[str, A
         if method_name == "get_active_hypotheses":
             logger.debug("Falling back to %s() after incompatible state= signature", method_name, exc_info=True)
             return _coerce_proposed_hypotheses(method())
-        logger.debug("Skipping cortex method %s due to incompatible signature", method_name, exc_info=True)
+        logger.debug("Skipping proposer method %s due to incompatible signature", method_name, exc_info=True)
     except Exception:
-        logger.exception("Failed to query hypotheses via cortex method %s", method_name)
+        logger.exception("Failed to query hypotheses via proposer method %s", method_name)
     return []
 
 
-def _query_proposed_hypotheses(cortex: Any, base_dir: Path) -> list[dict[str, Any]]:
-    if cortex is not None:
+def _query_proposed_hypotheses(proposer: Any, base_dir: Path) -> list[dict[str, Any]]:
+    if proposer is not None:
         for method_name in (
             "get_active_hypotheses",
             "get_proposed_hypotheses",
@@ -133,7 +133,7 @@ def _query_proposed_hypotheses(cortex: Any, base_dir: Path) -> list[dict[str, An
             "get_hypotheses",
             "fetch_hypotheses",
         ):
-            method = getattr(cortex, method_name, None)
+            method = getattr(proposer, method_name, None)
             if callable(method):
                 hypotheses = _invoke_hypothesis_method(method_name, method)
                 if hypotheses:
@@ -144,15 +144,15 @@ def _query_proposed_hypotheses(cortex: Any, base_dir: Path) -> list[dict[str, An
 
 
 def _load_emitter() -> Any:
-    events_path = SRC_DIR / "events.py"
-    module = _load_module(events_path, "cerebellum_events")
+    events_path = SRC_DIR / "event_bus.py"
+    module = _load_module(events_path, "cerebellum_event_bus")
     if module is None:
-        logger.warning("events.py unavailable; emitter disabled")
+        logger.warning("event_bus.py unavailable; emitter disabled")
         return None
 
-    emitter_cls = getattr(module, "CerebellumEventEmitter", None)
+    emitter_cls = getattr(module, "EventBus", None)
     if emitter_cls is None:
-        logger.warning("CerebellumEventEmitter not found in %s", events_path)
+        logger.warning("EventBus not found in %s", events_path)
         return None
 
     try:
@@ -162,33 +162,33 @@ def _load_emitter() -> Any:
         return None
 
 
-def _load_hippocampus() -> Any:
-    hippo_path = SRC_DIR / "hippocampus.py"
-    module = _load_module(hippo_path, "cerebellum_hippocampus")
+def _load_episode_store() -> Any:
+    episode_store_path = SRC_DIR / "episode_store.py"
+    module = _load_module(episode_store_path, "cerebellum_episode_store")
     if module is None:
-        logger.warning("hippocampus.py unavailable; hippocampus disabled")
+        logger.warning("episode_store.py unavailable; episode store disabled")
         return None
 
-    hippo_cls = getattr(module, "Hippocampus", None)
-    if hippo_cls is None:
-        logger.warning("Hippocampus not found in %s", hippo_path)
+    episode_store_cls = getattr(module, "EpisodeStore", None)
+    if episode_store_cls is None:
+        logger.warning("EpisodeStore not found in %s", episode_store_path)
         return None
 
     try:
-        return hippo_cls(str(BASE_DIR / "config.json"))
+        return episode_store_cls(str(BASE_DIR / "config.json"))
     except Exception:
-        logger.exception("Failed to instantiate hippocampus from %s", hippo_path)
+        logger.exception("Failed to instantiate episode store from %s", episode_store_path)
         return None
 
 
-def _wire_cortex(cortex: Any, emitter: Any, hippocampus: Any) -> None:
-    if cortex is None:
+def _wire_proposer(proposer: Any, emitter: Any, episode_store: Any) -> None:
+    if proposer is None:
         return
-    if emitter is not None and not getattr(cortex, "emitter", None):
-        cortex.emitter = emitter
-    if hippocampus is not None and not getattr(cortex, "hippocampus", None):
-        cortex.hippocampus = hippocampus
-    logger.info("Cortex wired with emitter=%s, hippocampus=%s", emitter is not None, hippocampus is not None)
+    if emitter is not None and not getattr(proposer, "emitter", None):
+        proposer.emitter = emitter
+    if episode_store is not None and not getattr(proposer, "hippocampus", None):
+        proposer.hippocampus = episode_store
+    logger.info("Proposer wired with emitter=%s, episode_store=%s", emitter is not None, episode_store is not None)
 
 
 def _compute_sleep_duration(config: dict[str, Any], cycle_started: float) -> float:
@@ -227,17 +227,17 @@ def main() -> int:
     signal.signal(signal.SIGINT, _handle_signal)
 
     config = _load_loop_config()
-    cortex = _load_cortex()
+    proposer = _load_proposer()
     emitter = _load_emitter()
-    hippocampus = _load_hippocampus()
-    _wire_cortex(cortex, emitter, hippocampus)
-    arbiter = BasalGanglia(str(BASE_DIR / "policy.yaml"), cortex=cortex, emitter=emitter)
+    episode_store = _load_episode_store()
+    _wire_proposer(proposer, emitter, episode_store)
+    arbiter = PolicyArbiter(str(BASE_DIR / "policy.yaml"), cortex=proposer, emitter=emitter)
 
     logger.info("Cerebellum arbiter loop started")
     while not STOP_REQUESTED:
         cycle_started = time.time()
         try:
-            hypotheses = _query_proposed_hypotheses(cortex, BASE_DIR)
+            hypotheses = _query_proposed_hypotheses(proposer, BASE_DIR)
             logger.info("Found %d proposed hypotheses", len(hypotheses))
             for hypothesis in hypotheses:
                 decision = arbiter.evaluate(hypothesis)

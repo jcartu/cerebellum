@@ -37,6 +37,7 @@ OPENCLAW_FALLBACK_BINARY_PATHS = (
     Path("/usr/local/bin/openclaw"),
     Path("/usr/bin/openclaw"),
 )
+COSTLY_AUTO_EXECUTE_TOOLS = {"model.call", "web.search"}
 SENSITIVE_HYPOTHESIS_FIELD_TOKENS = (
     "api_key",
     "api_keys",
@@ -179,7 +180,7 @@ class _PinnedHTTPSHandler(urllib.request.HTTPSHandler):
         )
 
 
-class BasalGanglia:
+class PolicyArbiter:
     """Action arbiter - decides what to do with hypotheses."""
 
     def __init__(self, config_path: str, emitter: Any = None, cortex: Any = None):
@@ -216,38 +217,49 @@ class BasalGanglia:
         hypothesis_id = str(hypothesis.get("id") or hypothesis.get("hypothesis_id") or uuid.uuid4())
         daily_budget = float(self.cost_limiter.max_cost)
         raw_confidence = hypothesis.get("confidence")
-        raw_cost = hypothesis.get("cost")
+        raw_generation_cost = hypothesis.get("generation_cost_usd", hypothesis.get("cost"))
+        raw_estimated_execution_cost = hypothesis.get("estimated_execution_cost_usd")
         try:
             confidence = float(raw_confidence or 0.0)
-            cost = float(raw_cost or 0.0)
+            generation_cost_usd = float(raw_generation_cost or 0.0)
         except (TypeError, ValueError):
             logger.warning(
-                "Rejected hypothesis %s: invalid numeric cost/confidence (confidence=%r, cost=%r)",
+                "Rejected hypothesis %s: invalid numeric generation cost/confidence (confidence=%r, generation_cost_usd=%r)",
                 hypothesis_id,
                 raw_confidence,
-                raw_cost,
+                raw_generation_cost,
             )
-            return self._record_decision(hypothesis_id, "discard", "invalid cost/confidence")
-        if not math.isfinite(confidence) or not math.isfinite(cost) or confidence < 0.0 or cost < 0.0:
+            return self._record_decision(hypothesis_id, "discard", "invalid generation cost/confidence")
+        if (
+            not math.isfinite(confidence)
+            or not math.isfinite(generation_cost_usd)
+            or confidence < 0.0
+            or generation_cost_usd < 0.0
+        ):
             logger.warning(
-                "Rejected hypothesis %s: non-finite or negative cost/confidence (confidence=%r, cost=%r)",
+                "Rejected hypothesis %s: non-finite or negative generation cost/confidence (confidence=%r, generation_cost_usd=%r)",
                 hypothesis_id,
                 raw_confidence,
-                raw_cost,
+                raw_generation_cost,
             )
-            return self._record_decision(hypothesis_id, "discard", "invalid cost/confidence")
+            return self._record_decision(hypothesis_id, "discard", "invalid generation cost/confidence")
         if confidence > 1.0:
             logger.warning("Clamped hypothesis %s confidence from %s to 1.0", hypothesis_id, confidence)
             confidence = 1.0
-        if cost > daily_budget:
-            logger.warning("Clamped hypothesis %s cost from %s to daily budget %s", hypothesis_id, cost, daily_budget)
-            cost = daily_budget
-        # NOTE: `cost` here is the hypothesis-generation LLM token cost ONLY.
-        # It is NOT the cost of executing the plan. Execution cost is not
-        # currently modeled — see audit H8. The budget check below therefore
-        # only rate-limits hypothesis-generation spend, not tool-execution spend.
+        if generation_cost_usd > daily_budget:
+            logger.warning(
+                "Clamped hypothesis %s generation cost from %s to daily budget %s",
+                hypothesis_id,
+                generation_cost_usd,
+                daily_budget,
+            )
+            generation_cost_usd = daily_budget
+        estimated_execution_cost_usd = self._coerce_optional_float(raw_estimated_execution_cost)
         reversibility = str(hypothesis.get("reversibility") or "unknown")
         tools = self._extract_tools(hypothesis)
+        missing_execution_cost_for_costly_tools = (
+            estimated_execution_cost_usd is None and bool(COSTLY_AUTO_EXECUTE_TOOLS.intersection(tools))
+        )
 
         try:
             self._refresh_kill_switch_from_disk()
@@ -257,7 +269,7 @@ class BasalGanglia:
             if not self.action_limiter.allow():
                 return self._record_decision(hypothesis_id, "discard", "action rate limit reached")
 
-            if not self.cost_limiter.allow(cost):
+            if not self.cost_limiter.allow(generation_cost_usd):
                 return self._record_decision(hypothesis_id, "discard", "daily llm budget exceeded")
 
             forbidden = set(self.policy.get("forbidden_tools", []))
@@ -273,23 +285,31 @@ class BasalGanglia:
             allowed_tools = set(auto_cfg.get("allowed_tools", []))
             if (
                 confidence >= float(auto_cfg.get("min_confidence", 0.85))
-                and cost <= float(auto_cfg.get("max_cost", 0.3))
+                and generation_cost_usd <= float(auto_cfg.get("max_cost", 0.3))
                 and reversibility in set(auto_cfg.get("required_reversibility", []))
                 and all(tool in allowed_tools for tool in tools)
             ):
+                if missing_execution_cost_for_costly_tools:
+                    # TODO(Phase 5): allow auto-execution once real execution-cost
+                    # estimates are populated for costly tools like model/web calls.
+                    return self._record_decision(
+                        hypothesis_id,
+                        "stage_notify",
+                        "missing execution cost estimate for costly auto-execute tools",
+                    )
                 return self._record_decision(hypothesis_id, "auto_execute", "meets auto-execute policy")
 
             stage_cfg = self.policy.get("stage_notify", {})
             if (
                 confidence >= float(stage_cfg.get("min_confidence", 0.6))
-                and cost <= float(stage_cfg.get("max_cost", 0.8))
+                and generation_cost_usd <= float(stage_cfg.get("max_cost", 0.8))
             ):
                 return self._record_decision(hypothesis_id, "stage_notify", "requires approval")
 
             discard_cfg = self.policy.get("discard", {})
             if (
                 confidence <= float(discard_cfg.get("max_confidence", 0.5))
-                or cost >= float(discard_cfg.get("min_cost", 0.9))
+                or generation_cost_usd >= float(discard_cfg.get("min_cost", 0.9))
             ):
                 return self._record_decision(hypothesis_id, "discard", "below policy thresholds")
 
@@ -797,7 +817,7 @@ class BasalGanglia:
     def _execute_step(self, tool_name: str, step: dict[str, Any]) -> dict[str, Any]:
         handlers = {
             "browser.screenshot": self._handle_browser_screenshot,
-            "browser.navigate": self._handle_browser_navigate,
+            "http.get": self._handle_http_get,
             "web.search": self._handle_web_search,
             "file.read": self._handle_file_read,
             "memory.query": self._handle_memory_query,
@@ -819,10 +839,10 @@ class BasalGanglia:
             "note": "CDP integration not configured in Phase 4 runtime; step recorded for external executor.",
         }
 
-    def _handle_browser_navigate(self, step: dict[str, Any]) -> dict[str, Any]:
+    def _handle_http_get(self, step: dict[str, Any]) -> dict[str, Any]:
         url = str(step.get("url") or "")
         if not url:
-            raise ValueError("browser.navigate requires a url")
+            raise ValueError("http.get requires a url")
         safe_ip, host_header = self._validate_url(url)
 
         parsed = urllib.parse.urlparse(url)
@@ -862,7 +882,7 @@ class BasalGanglia:
                 content_type = None
             return {
                 "status": "ok",
-                "tool": "browser.navigate",
+                "tool": "http.get",
                 "url": url,
                 "resolved_ip": safe_ip,
                 "http_status": http_status,
@@ -1029,6 +1049,17 @@ class BasalGanglia:
                     logger.warning("Ignoring non-numeric execution cost %r for key %s", value, key)
         return 0.0
 
+    def _coerce_optional_float(self, value: Any) -> float | None:
+        if value is None:
+            return None
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(parsed) or parsed < 0.0:
+            return None
+        return parsed
+
     def _resolve_openclaw_binary(self) -> Path | None:
         telegram_cfg = self.runtime_config.get("telegram") if isinstance(self.runtime_config.get("telegram"), dict) else {}
         configured_binary = str(telegram_cfg.get("fallback_binary") or "").strip()
@@ -1094,14 +1125,16 @@ class BasalGanglia:
         hypothesis_id = str(hypothesis.get("id") or hypothesis.get("hypothesis_id") or "unknown")
         summary = str(hypothesis.get("summary") or hypothesis.get("title") or "No summary provided")
         confidence = hypothesis.get("confidence", "n/a")
-        cost = hypothesis.get("estimated_cost") or hypothesis.get("cost") or "n/a"
+        generation_cost = hypothesis.get("generation_cost_usd", hypothesis.get("cost", "n/a"))
+        execution_cost = hypothesis.get("estimated_execution_cost_usd")
         tools = ", ".join(self._extract_tools(hypothesis)) or "none"
         return (
             "CEREBELLUM Approval Required\n\n"
             f"ID: {hypothesis_id}\n"
             f"Summary: {summary}\n"
             f"Confidence: {confidence}\n"
-            f"Estimated Cost: {cost}\n"
+            f"Generation Cost (USD): {generation_cost}\n"
+            f"Estimated Execution Cost (USD): {execution_cost if execution_cost is not None else 'unknown'}\n"
             f"Tools: {tools}\n"
             f"Reasoning: {hypothesis.get('reasoning') or 'n/a'}"
         )
@@ -1116,7 +1149,7 @@ class BasalGanglia:
                         return
                     except TypeError as exc:
                         logger.debug(
-                            "Cortex state update via %s(hypothesis_id, state, payload) failed; trying fallback signature: %s",
+                            "Proposer state update via %s(hypothesis_id, state, payload) failed; trying fallback signature: %s",
                             method_name,
                             exc,
                         )
@@ -1125,16 +1158,16 @@ class BasalGanglia:
                             return
                         except TypeError as fallback_exc:
                             logger.debug(
-                                "Cortex state update via %s(hypothesis_id, state) failed after fallback attempt: %s",
+                                "Proposer state update via %s(hypothesis_id, state) failed after fallback attempt: %s",
                                 method_name,
                                 fallback_exc,
                             )
                         except Exception:
-                            logger.exception("Cortex state update failed via %s(hypothesis_id, state)", method_name)
+                            logger.exception("Proposer state update failed via %s(hypothesis_id, state)", method_name)
                     except Exception:
-                        logger.exception("Cortex state update failed via %s", method_name)
+                        logger.exception("Proposer state update failed via %s", method_name)
             logger.warning(
-                "No compatible cortex state update signature succeeded for %s; falling back to local persistence",
+                "No compatible proposer state update signature succeeded for %s; falling back to local persistence",
                 hypothesis_id,
             )
             logger.warning("Falling back to local hypothesis state persistence for %s", hypothesis_id)
@@ -1166,7 +1199,7 @@ class BasalGanglia:
     def _persist_event(self, topic: str, payload: dict[str, Any]) -> None:
         """Fallback event persistence: append to JSONL in state_dir.
 
-        The canonical event store is events.db via CerebellumEventEmitter.
+        The canonical event store is events.db via EventBus.
         This fallback is used only when no emitter is wired.
         """
         fallback_path = self.state_dir / "arbiter_fallback_events.jsonl"
@@ -1234,3 +1267,6 @@ class BasalGanglia:
     def _append_jsonl(self, path: Path, payload: dict[str, Any]) -> None:
         with self._lock, path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+
+BasalGanglia = PolicyArbiter

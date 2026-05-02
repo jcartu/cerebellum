@@ -1,8 +1,8 @@
 {
-  "name": "cerebellum-hippocampus-cluster",
+  "name": "cerebellum-episode-store-cluster",
   "schedule": "*/15 * * * *",
   "enabled": true,
   "model": "openrouter/openai/gpt-4o",
-  "prompt": "Run the hippocampus episodic clusterer. Query events from the last 15 minutes, cluster them into episodes, and store in the graph.",
+  "prompt": "Run the episode store episodic clusterer. Query events from the last 15 minutes, cluster them into episodes, and store them in the graph.",
   "script": "scripts/cluster_episodes.py"
 }

@@ -4,7 +4,7 @@
 
 # 🧠 CEREBELLUM
 
-### *A shadow cognition layer that watches your AI agent, learns its patterns, and proposes the next best action.*
+### CEREBELLUM is a proactive ops assistant for RASPUTIN. It records every event your agent emits, clusters them into episodes, mines pairwise successor patterns, and uses an LLM to propose actions. A YAML policy decides which actions auto-execute, which need your Telegram approval, and which get discarded. It does not do causal inference. It does not learn from your approvals — yet.
 
 [![Status](https://img.shields.io/badge/status-alpha-orange)]()
 [![Python](https://img.shields.io/badge/python-3.11+-blue)](https://www.python.org/downloads/)
@@ -19,7 +19,7 @@
 
 > *"An agent without a cerebellum is a brain without reflexes. It thinks, but it cannot learn what usually follows what."*
 
-CEREBELLUM sits **beside** your agent, not inside it. It records every event, stitches them into episodes, finds causal links, and suggests what to do next. You set the rules. High-risk actions wait for your approval. Safe ones happen automatically.
+CEREBELLUM sits **beside** your agent, not inside it. It records every event, stitches them into episodes, identifies successor patterns, and suggests what to do next. You set the rules. High-risk actions wait for your approval. Safe ones happen automatically.
 
 ---
 
@@ -31,12 +31,12 @@ CEREBELLUM fixes this by running as a separate process that:
 
 1. 📥 **Ingests** every event via NATS JetStream and SQLite
 2. 🧵 **Clusters** events into episodes to find related entities — files, services, people
-3. 🔗 **Mines** causal patterns to see what events tend to precede others
-4. 💡 **Hypothesizes** actionable next steps using an LLM grounded in real context
+3. 🔗 **Mines** successor patterns to see what events tend to precede others
+4. 💡 **Proposes** actionable next steps using an LLM grounded in real context
 5. ⚖️ **Arbitrates** every plan against your YAML policy
 6. 🏃 **Executes** approved plans in a hardened sandbox
 
-The result is an advisor that learns your system's rhythms. It does the obvious work for you and asks for permission on everything else.
+The result is an advisor that tracks your system's rhythms. It does the obvious work for you and asks for permission on everything else.
 
 ---
 
@@ -53,28 +53,28 @@ The result is an advisor that learns your system's rhythms. It does the obvious 
         │          🧠 CEREBELLUM (4 components)             │
         │                                                   │
         │  ┌─────────────┐      ┌──────────────────┐        │
-        │  │ OBSERVATORY │─────▶│   EVENT STORE    │        │
+        │  │  EVENT BUS  │─────▶│   EVENT STORE    │        │
         │  │  (NATS sub) │      │ SQLite WAL + JS  │        │
         │  └─────────────┘      └────────┬─────────┘        │
         │                                │                  │
         │                                ▼                  │
         │                      ┌───────────────────┐        │
-        │                      │   HIPPOCAMPUS     │        │
+        │                      │   EPISODE STORE   │        │
         │                      │  KuzuDB graph +   │        │
         │                      │  episodes +       │        │
-        │                      │  causal edges     │        │
+        │                      │  successor edges  │        │
         │                      └────────┬──────────┘        │
         │                                │                  │
         │                                ▼                  │
         │                      ┌───────────────────┐        │
-        │                      │ PREFRONTAL CORTEX │        │
+        │                      │     PROPOSER      │        │
         │                      │  LLM hypothesis   │        │
         │                      │  generator (5min) │        │
         │                      └────────┬──────────┘        │
         │                                │                  │
         │                                ▼                  │
         │                      ┌───────────────────┐        │
-        │                      │  BASAL GANGLIA    │        │
+        │                      │  POLICY ARBITER   │        │
         │                      │  Policy arbiter   │        │
         │                      │  + kill switch    │        │
         │                      └────┬────┬────┬────┘        │
@@ -85,6 +85,7 @@ The result is an advisor that learns your system's rhythms. It does the obvious 
         │                      │  TELEGRAM   │◀── approve   │
         │                      │  (you)      │    reject    │
         │                      └─────────────┘    snooze    │
+        │                                                   │
         └───────────────────────────────────────────────────┘
 ```
 
@@ -92,10 +93,20 @@ The result is an advisor that learns your system's rhythms. It does the obvious 
 
 | Component | Role | Persistent State |
 | :--- | :--- | :--- |
-| 👁️ **Observatory** | Event ingest and NATS relay | `events.db` |
-| 🧠 **Hippocampus** | Episodic and causal memory | `hippocampus.kuzu` |
-| 💭 **Prefrontal Cortex** | Hypothesis generation | `hypotheses.db` |
-| ⚖️ **Basal Ganglia** | Policy-gated action arbiter | `pending_approvals.json` |
+| 👁️ **EventBus** | Event ingest and NATS relay | `events.db` |
+| 🧠 **EpisodeStore** | Episodic and successor memory | `hippocampus.kuzu` |
+| 💭 **Proposer** | Hypothesis generation | `hypotheses.db` |
+| ⚖️ **PolicyArbiter** | Policy-gated action arbiter | `pending_approvals.json` |
+
+---
+
+## ⚠️ Limitations
+
+CEREBELLUM is in early alpha. The following features are planned but not yet implemented:
+
+- **Self-Improvement**: The system does not yet learn from your approvals or rejections.
+- **Causal Inference**: Successor edges represent temporal correlation, not proven causality.
+- **Execution-Cost Modeling**: The arbiter does not yet account for the computational or financial cost of executing proposed actions.
 
 ---
 
@@ -162,7 +173,7 @@ curl -H "Authorization: Bearer $DASHBOARD_TOKEN" http://127.0.0.1:18790/healthz
 }
 ```
 
-### `policy.yaml` — the rulebook for the Basal Ganglia
+### `policy.yaml` — the rulebook for the PolicyArbiter
 
 ```yaml
 global:
@@ -229,7 +240,7 @@ Events follow a standard shape across SQLite and NATS:
   "timestamp": "2024-11-20T04:12:33.456+00:00",
   "type": "cerebellum.hypothesis",
   "payload": { "title": "Fix OOM", "action": "..." },
-  "actor": "cerebellum.cortex",
+  "actor": "cerebellum.proposer",
   "context": { "source": "phase3" }
 }
 ```

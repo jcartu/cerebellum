@@ -22,9 +22,9 @@ import uvicorn
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
-from cerebellum.arbiter import BasalGanglia
-from cerebellum.events import CerebellumEventEmitter
+from cerebellum.event_bus import EventBus
 from cerebellum.http_safe import _safe_opener
+from cerebellum.policy_arbiter import PolicyArbiter
 
 logger = logging.getLogger(__name__)
 
@@ -44,29 +44,29 @@ CONFIG_PATH = _config_path()
 
 
 # Lazy singleton — avoids module-level side effects
-_emitter: CerebellumEventEmitter | None = None
-_arbiter: BasalGanglia | None = None
+_emitter: EventBus | None = None
+_arbiter: PolicyArbiter | None = None
 
 
-def get_emitter() -> CerebellumEventEmitter:
+def get_emitter() -> EventBus:
     global _emitter
     if _emitter is None:
         try:
-            _emitter = CerebellumEventEmitter(CONFIG_PATH)
+            _emitter = EventBus(CONFIG_PATH)
         except Exception:
             logger.exception("Failed to initialize emitter")
             raise RuntimeError("Dashboard cannot start: emitter unavailable")
     return _emitter
 
 
-def get_arbiter() -> BasalGanglia | None:
+def get_arbiter() -> PolicyArbiter | None:
     global _arbiter
     if _arbiter is None:
         policy_path = _base_dir() / "policy.yaml"
         if not policy_path.exists():
             return None
         try:
-            _arbiter = BasalGanglia(str(policy_path), emitter=get_emitter())
+            _arbiter = PolicyArbiter(str(policy_path), emitter=get_emitter())
         except Exception:
             logger.exception("Failed to initialize arbiter")
             return None

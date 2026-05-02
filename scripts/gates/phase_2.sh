@@ -20,17 +20,17 @@ else
 fi
 
 # Check hippocampus causal edge logic
-if grep -q "causal" src/cerebellum/hippocampus.py 2>/dev/null; then
+if grep -q "causal" src/cerebellum/episode_store.py 2>/dev/null; then
   pass "Causal edge logic present"
 else
-  fail "No causal edge logic in hippocampus.py"
+  fail "No causal edge logic in episode_store.py"
 fi
 
 # Check episode clustering exists
-if grep -q "cluster" src/cerebellum/hippocampus.py 2>/dev/null; then
+if grep -q "cluster" src/cerebellum/episode_store.py 2>/dev/null; then
   pass "Episode clustering logic present"
 else
-  fail "No episode clustering in hippocampus.py"
+  fail "No episode clustering in episode_store.py"
 fi
 
 # Run tests

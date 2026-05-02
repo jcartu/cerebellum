@@ -37,10 +37,10 @@ else
 fi
 
 # Check event deduplication logic exists
-if grep -q "dedup" src/cerebellum/events.py 2>/dev/null; then
+if grep -q "dedup" src/cerebellum/event_bus.py 2>/dev/null; then
   pass "Event deduplication logic present"
 else
-  fail "No deduplication logic in events.py"
+  fail "No deduplication logic in event_bus.py"
 fi
 
 # Run tests

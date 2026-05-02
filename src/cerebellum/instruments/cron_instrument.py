@@ -4,11 +4,11 @@ import time
 from collections.abc import Callable
 from typing import Any
 
-from cerebellum.events import CerebellumEventEmitter
+from cerebellum.event_bus import EventBus
 
 
 class CronInstrumenter:
-    def __init__(self, emitter: CerebellumEventEmitter) -> None:
+    def __init__(self, emitter: EventBus) -> None:
         self.emitter = emitter
 
     def run(self, job_name: str, func: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:

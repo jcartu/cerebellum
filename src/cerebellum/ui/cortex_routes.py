@@ -6,11 +6,11 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query
 
-from cerebellum.cortex import PrefrontalCortex
+from cerebellum.proposer import Proposer
 
 router = APIRouter(tags=["cerebellum-hypotheses"])
 
-# Singleton cortex — avoids per-request instantiation (H10 fix)
+# Singleton proposer — avoids per-request instantiation (H10 fix)
 _cortex: Any = None
 
 
@@ -18,7 +18,7 @@ def _get_cortex():
     global _cortex
     if _cortex is None:
         base_dir = Path(os.environ.get("CEREBELLUM_BASE_DIR", str(Path(__file__).resolve().parents[3]))).expanduser()
-        _cortex = PrefrontalCortex(config_path=str(base_dir / "config.json"))
+        _cortex = Proposer(config_path=str(base_dir / "config.json"))
     return _cortex
 
 

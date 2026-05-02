@@ -20,7 +20,7 @@ from nats.aio.msg import Msg
 logger = logging.getLogger(__name__)
 
 
-class CerebellumEventEmitter:
+class EventBus:
     def __init__(self, config_path: str | Path) -> None:
         self.config_path = Path(config_path)
         self.config = self._load_config(self.config_path)
@@ -181,7 +181,7 @@ class CerebellumEventEmitter:
         remaining_inflight = self._wait_for_inflight_publishes(self._close_publish_timeout_seconds)
         if remaining_inflight:
             logger.warning(
-                "Event emitter closed with %d publish(es) still inflight after %.1fs timeout",
+                "Event bus closed with %d publish(es) still inflight after %.1fs timeout",
                 remaining_inflight,
                 self._close_publish_timeout_seconds,
             )
@@ -191,6 +191,8 @@ class CerebellumEventEmitter:
 
         self._loop.call_soon_threadsafe(self._loop.stop)
         self._loop_thread.join(timeout=2)
+        if not self._loop.is_closed():
+            self._loop.close()
 
     def _load_config(self, config_path: Path) -> dict[str, Any]:
         try:
@@ -234,7 +236,7 @@ class CerebellumEventEmitter:
     def _start_checkpoint_worker(self) -> None:
         self._checkpoint_thread = threading.Thread(
             target=self._checkpoint_worker,
-            name="cerebellum-events-wal-checkpoint",
+            name="cerebellum-event-bus-wal-checkpoint",
             daemon=True,
         )
         self._checkpoint_thread.start()
@@ -363,7 +365,7 @@ class CerebellumEventEmitter:
                 if inspect.isawaitable(result):
                     await result
             except Exception as exc:
-                logger.error("Event subscription callback failed: %s", exc)
+                logger.error("Event bus subscription callback failed: %s", exc)
 
         try:
             await self._nc.subscribe("cerebellum.events.>", cb=_handler)
@@ -381,3 +383,6 @@ class CerebellumEventEmitter:
             "actor": row["actor"],
             "context": json.loads(row["context"]),
         }
+
+
+CerebellumEventEmitter = EventBus

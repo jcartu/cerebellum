@@ -35,7 +35,8 @@ class Hypothesis:
     description: str
     confidence: float
     utility: float
-    cost: float
+    generation_cost_usd: float
+    estimated_execution_cost_usd: float | None
     reversibility: str
     plan: list[str]
     tools_required: list[str]
@@ -47,7 +48,7 @@ class Hypothesis:
         return asdict(self)
 
 
-class PrefrontalCortex:
+class Proposer:
     """Hypothesis generation engine."""
 
     DEFAULT_MODELS = ["openai/gpt-4o", "anthropic/claude-opus-4-7"]
@@ -102,11 +103,11 @@ class PrefrontalCortex:
     def _load_config(self) -> dict[str, Any]:
         try:
             if not self.config_path.exists():
-                logger.warning("Cortex config not found at %s; using defaults", self.config_path)
+                logger.warning("Proposer config not found at %s; using defaults", self.config_path)
                 return {}
             return json.loads(self.config_path.read_text(encoding="utf-8"))
         except Exception as exc:
-            logger.error("Failed to load cortex config %s: %s", self.config_path, exc)
+            logger.error("Failed to load proposer config %s: %s", self.config_path, exc)
             return {}
 
     def _build_client(self):
@@ -153,7 +154,8 @@ class PrefrontalCortex:
                       description TEXT,
                       confidence REAL,
                       utility REAL,
-                      cost REAL,
+                      generation_cost_usd REAL,
+                      estimated_execution_cost_usd REAL,
                       reversibility TEXT,
                       plan TEXT,
                       tools_required TEXT,
@@ -165,6 +167,7 @@ class PrefrontalCortex:
                     )
                     """
                 )
+                self._ensure_hypothesis_schema(conn)
                 conn.execute(
                     "CREATE INDEX IF NOT EXISTS idx_hypotheses_state_timestamp ON hypotheses(state, timestamp DESC)"
                 )
@@ -231,7 +234,7 @@ class PrefrontalCortex:
                 "current_time": datetime.now(UTC).isoformat(),
             }
             return (
-                "You are the prefrontal cortex for CEREBELLUM, a shadow cognition layer for RASPUTIN. "
+                "You are the proposer for CEREBELLUM, a shadow cognition layer for RASPUTIN. "
                 "Analyze recent system behavior and propose a small set of high-value hypotheses about useful next actions, risks, or follow-up work.\n\n"
                 "Rules:\n"
                 "1. Return ONLY valid JSON. No markdown, no prose, no code fences.\n"
@@ -303,6 +306,25 @@ class PrefrontalCortex:
                     )
                     time.sleep(delay)
         return [], dict(EMPTY_USAGE)
+
+    def _ensure_hypothesis_schema(self, conn: sqlite3.Connection) -> None:
+        columns = {str(row["name"]) for row in conn.execute("PRAGMA table_info(hypotheses)").fetchall()}
+        if "generation_cost_usd" not in columns:
+            conn.execute("ALTER TABLE hypotheses ADD COLUMN generation_cost_usd REAL")
+        if "estimated_execution_cost_usd" not in columns:
+            conn.execute("ALTER TABLE hypotheses ADD COLUMN estimated_execution_cost_usd REAL")
+        if "cost" in columns:
+            conn.execute(
+                """
+                UPDATE hypotheses
+                SET generation_cost_usd = COALESCE(generation_cost_usd, cost, 0.0)
+                WHERE generation_cost_usd IS NULL
+                """
+            )
+        else:
+            conn.execute(
+                "UPDATE hypotheses SET generation_cost_usd = COALESCE(generation_cost_usd, 0.0) WHERE generation_cost_usd IS NULL"
+            )
 
     def _extract_usage(self, response: Any, model: str | None = None) -> dict[str, Any]:
         usage_payload = dict(EMPTY_USAGE)
@@ -430,7 +452,7 @@ class PrefrontalCortex:
             return
         self._checkpoint_thread = threading.Thread(
             target=self._checkpoint_worker,
-            name="cerebellum-cortex-wal-checkpoint",
+            name="cerebellum-proposer-wal-checkpoint",
             daemon=True,
         )
         self._checkpoint_thread.start()
@@ -441,7 +463,7 @@ class PrefrontalCortex:
                 with self._db_lock:
                     self._get_connection().execute("PRAGMA wal_checkpoint(TRUNCATE)")
             except Exception as exc:
-                logger.warning("Cortex WAL checkpoint failed: %s", exc)
+                logger.warning("Proposer WAL checkpoint failed: %s", exc)
 
     def get_active_hypotheses(self, state: str | None = None, limit: int = 50) -> list[dict]:
         """Query hypotheses by state."""
@@ -558,7 +580,7 @@ class PrefrontalCortex:
                     SELECT COUNT(*) AS total,
                            AVG(confidence) AS avg_confidence,
                            AVG(utility) AS avg_utility,
-                           AVG(cost) AS avg_cost
+                           AVG(generation_cost_usd) AS avg_cost
                     FROM hypotheses
                     """
                 ).fetchone()
@@ -704,7 +726,10 @@ class PrefrontalCortex:
                 description=description,
                 confidence=self._clamp_float(item.get("confidence", 0.0)),
                 utility=self._clamp_float(item.get("utility", 0.0)),
-                cost=derived_cost,
+                generation_cost_usd=derived_cost,
+                # TODO(Phase 5): estimate the real execution cost of the plan instead
+                # of leaving this unknown at proposal-generation time.
+                estimated_execution_cost_usd=None,
                 reversibility=reversibility,
                 plan=plan,
                 tools_required=tools_required,
@@ -804,9 +829,10 @@ class PrefrontalCortex:
                 conn.execute(
                     """
                     INSERT INTO hypotheses (
-                        id, timestamp, title, description, confidence, utility, cost,
+                        id, timestamp, title, description, confidence, utility,
+                        generation_cost_usd, estimated_execution_cost_usd,
                         reversibility, plan, tools_required, context_summary, state, metadata
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         hypothesis.id,
@@ -815,7 +841,8 @@ class PrefrontalCortex:
                         hypothesis.description,
                         hypothesis.confidence,
                         hypothesis.utility,
-                        hypothesis.cost,
+                        hypothesis.generation_cost_usd,
+                        hypothesis.estimated_execution_cost_usd,
                         hypothesis.reversibility,
                         json.dumps(hypothesis.plan, ensure_ascii=False),
                         json.dumps(hypothesis.tools_required, ensure_ascii=False),
@@ -832,6 +859,11 @@ class PrefrontalCortex:
 
     def _row_to_dict(self, row: sqlite3.Row) -> dict[str, Any]:
         result = dict(row)
+        if "generation_cost_usd" not in result or result.get("generation_cost_usd") is None:
+            result["generation_cost_usd"] = result.get("cost") or 0.0
+        if "estimated_execution_cost_usd" not in result:
+            result["estimated_execution_cost_usd"] = None
+        result.pop("cost", None)
         result["plan"] = self._parse_json_column(result.get("plan"), [])
         result["tools_required"] = self._parse_json_column(result.get("tools_required"), [])
         result["metadata"] = self._parse_json_column(result.get("metadata"), {})
@@ -850,9 +882,12 @@ class PrefrontalCortex:
             return
         try:
             if hasattr(self.emitter, "emit") and callable(self.emitter.emit):
-                self.emitter.emit(event_type, payload=payload, actor="cerebellum.cortex", context={"source": "phase3"})
+                self.emitter.emit(event_type, payload=payload, actor="cerebellum.proposer", context={"source": "phase3"})
                 return
             if hasattr(self.emitter, "publish") and callable(self.emitter.publish):
                 self.emitter.publish(event_type, payload)
         except Exception as exc:
             logger.warning("Failed to emit event %s: %s", event_type, exc)
+
+
+PrefrontalCortex = Proposer

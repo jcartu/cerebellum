@@ -13,24 +13,24 @@ warn() { echo -e "  ${YELLOW}WARN${NC} $1"; ((WARN++)); }
 echo "=== Phase 4 Exit Gate: Policy Arbiter ==="
 
 # Check arbiter policy engine
-if grep -q "policy" src/cerebellum/arbiter.py 2>/dev/null; then
+if grep -q "policy" src/cerebellum/policy_arbiter.py 2>/dev/null; then
   pass "Policy engine present"
 else
-  fail "No policy engine in arbiter.py"
+  fail "No policy engine in policy_arbiter.py"
 fi
 
 # Check kill-switch
-if grep -q "kill" src/cerebellum/arbiter.py 2>/dev/null; then
+if grep -q "kill" src/cerebellum/policy_arbiter.py 2>/dev/null; then
   pass "Kill-switch logic present"
 else
-  fail "No kill-switch in arbiter.py"
+  fail "No kill-switch in policy_arbiter.py"
 fi
 
 # Check approval tiers
-if grep -q "auto_execute\|stage\|discard" src/cerebellum/arbiter.py 2>/dev/null; then
+if grep -q "auto_execute\|stage\|discard" src/cerebellum/policy_arbiter.py 2>/dev/null; then
   pass "Approval tiers present"
 else
-  fail "No approval tiers in arbiter.py"
+  fail "No approval tiers in policy_arbiter.py"
 fi
 
 # Run tests

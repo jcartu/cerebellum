@@ -18,10 +18,10 @@ os.environ.setdefault("DASHBOARD_TOKEN", "test-dashboard-token")
 
 SRC_MODULES = [
     "cerebellum",
-    "cerebellum.arbiter",
-    "cerebellum.cortex",
-    "cerebellum.events",
-    "cerebellum.hippocampus",
+    "cerebellum.policy_arbiter",
+    "cerebellum.proposer",
+    "cerebellum.event_bus",
+    "cerebellum.episode_store",
     "cerebellum.http_safe",
     "cerebellum.observatory_main",
     "cerebellum.models",
@@ -36,7 +36,7 @@ SCRIPT_MODULES = {
     "scripts.arbiter_loop": SCRIPTS_DIR / "arbiter_loop.py",
     "scripts.generate_hypotheses": SCRIPTS_DIR / "generate_hypotheses.py",
     "scripts.cluster_episodes": SCRIPTS_DIR / "cluster_episodes.py",
-    "scripts.mine_causal_edges": SCRIPTS_DIR / "mine_causal_edges.py",
+    "scripts.mine_successor_edges": SCRIPTS_DIR / "mine_successor_edges.py",
 }
 
 

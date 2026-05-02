@@ -1,5 +1,5 @@
 {
-  "name": "cerebellum-cortex-generate",
+  "name": "cerebellum-proposer-generate",
   "schedule": "*/5 * * * *",
   "enabled": true,
   "model": "openrouter/openai/gpt-4o",

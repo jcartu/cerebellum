@@ -13,24 +13,24 @@ warn() { echo -e "  ${YELLOW}WARN${NC} $1"; ((WARN++)); }
 echo "=== Phase 3 Exit Gate: Hypothesis Engine ==="
 
 # Check cortex hypothesis generation
-if grep -q "generate_hypotheses" src/cerebellum/cortex.py 2>/dev/null; then
+if grep -q "generate_hypotheses" src/cerebellum/proposer.py 2>/dev/null; then
   pass "Hypothesis generation method exists"
 else
-  fail "No generate_hypotheses in cortex.py"
+  fail "No generate_hypotheses in proposer.py"
 fi
 
 # Check cost tracking
-if grep -q "cost" src/cerebellum/cortex.py 2>/dev/null; then
+if grep -q "cost" src/cerebellum/proposer.py 2>/dev/null; then
   pass "Cost tracking present"
 else
-  fail "No cost tracking in cortex.py"
+  fail "No cost tracking in proposer.py"
 fi
 
 # Check hypothesis lifecycle DB
-if grep -q "hypotheses" src/cerebellum/cortex.py 2>/dev/null; then
+if grep -q "hypotheses" src/cerebellum/proposer.py 2>/dev/null; then
   pass "Hypothesis lifecycle DB logic present"
 else
-  fail "No hypothesis lifecycle in cortex.py"
+  fail "No hypothesis lifecycle in proposer.py"
 fi
 
 # Run tests

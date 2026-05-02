@@ -8,8 +8,8 @@ from typing import Any
 
 BASE_DIR = Path(__file__).resolve().parent
 
-from cerebellum.events import CerebellumEventEmitter
-from cerebellum.hippocampus import Hippocampus
+from cerebellum.episode_store import EpisodeStore
+from cerebellum.event_bus import EventBus
 
 logger = logging.getLogger(__name__)
 
@@ -36,11 +36,11 @@ def cluster_by_time(events: list[dict[str, Any]], threshold_minutes: int = 5) ->
 def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s - %(message)s")
     config_path = str(BASE_DIR / "config.json")
-    emitter: CerebellumEventEmitter | None = None
+    emitter: EventBus | None = None
 
     try:
-        emitter = CerebellumEventEmitter(config_path)
-        hippocampus = Hippocampus(config_path)
+        emitter = EventBus(config_path)
+        episode_store = EpisodeStore(config_path)
         since = datetime.now(UTC) - timedelta(minutes=15)
         events = emitter.query(since=since, limit=500)
         clusters = cluster_by_time(events, threshold_minutes=5)
@@ -51,7 +51,7 @@ def main() -> int:
 
         for cluster in clusters:
             try:
-                episode_id = hippocampus.create_episode(cluster)
+                episode_id = episode_store.create_episode(cluster)
                 logger.info("Created episode %s from %d events", episode_id, len(cluster))
             except Exception as exc:
                 logger.error("Failed to create episode from cluster of %d events: %s", len(cluster), exc)
