@@ -2,38 +2,45 @@
 
 ![CEREBELLUM](logo.png)
 
+# 🧠 CEREBELLUM
+
+### *A shadow cognition layer that watches your AI agent, learns its patterns, and proposes the next best action.*
+
+[![Status](https://img.shields.io/badge/status-alpha-orange)]()
+[![Python](https://img.shields.io/badge/python-3.11+-blue)](https://www.python.org/downloads/)
+[![License](https://img.shields.io/badge/license-unreleased-red)]()
+[![NATS](https://img.shields.io/badge/NATS-JetStream-green)](https://nats.io)
+
+![CEREBELLUM Banner](banner.png)
+
 </div>
 
 ---
 
-# 🧠 CEREBELLUM
+> *"An agent without a cerebellum is a brain without reflexes. It thinks, but it cannot learn what usually follows what."*
 
-**A shadow cognition layer that watches your AI agent, learns its patterns, and proposes the next best action.**
-
-CEREBELLUM sits beside your agent instead of inside it. It records every event, stitches them into episodes, finds causal links, and suggests what to do next. You set the rules. High risk actions wait for your approval. Safe ones happen automatically.
-
-> "An agent without a cerebellum is a brain without reflexes. It thinks, but it cannot learn what usually follows what."
+CEREBELLUM sits **beside** your agent, not inside it. It records every event, stitches them into episodes, finds causal links, and suggests what to do next. You set the rules. High-risk actions wait for your approval. Safe ones happen automatically.
 
 ---
 
-## Why this exists
+## ✨ Why this exists
 
-AI agents don't remember their own behavior well. They don't notice that a browser crash at 3am usually follows a specific service error. They don't see when a user request leads to three failed tool calls. They can't schedule their own follow up work.
+AI agents don't remember their own behavior well. They don't notice that a browser crash at 3 AM usually follows a specific service error. They don't see when a user request leads to three failed tool calls. They can't schedule their own follow-up work.
 
 CEREBELLUM fixes this by running as a separate process that:
 
-1. **Ingests** every event via NATS JetStream and SQLite.
-2. **Clusters** events into episodes to find related entities like files, services, and people.
-3. **Mines** causal patterns to see what events tend to precede others.
-4. **Hypothesizes** actionable next steps using an LLM grounded in real context.
-5. **Arbitrates** every plan against your YAML policy.
-6. **Executes** approved plans in a hardened sandbox.
+1. 📥 **Ingests** every event via NATS JetStream and SQLite
+2. 🧵 **Clusters** events into episodes to find related entities — files, services, people
+3. 🔗 **Mines** causal patterns to see what events tend to precede others
+4. 💡 **Hypothesizes** actionable next steps using an LLM grounded in real context
+5. ⚖️ **Arbitrates** every plan against your YAML policy
+6. 🏃 **Executes** approved plans in a hardened sandbox
 
 The result is an advisor that learns your system's rhythms. It does the obvious work for you and asks for permission on everything else.
 
 ---
 
-## Architecture
+## 🏗️ Architecture
 
 ```text
 ┌─────────────────────────────────────────────────────────────────────────┐
@@ -81,29 +88,34 @@ The result is an advisor that learns your system's rhythms. It does the obvious 
         └───────────────────────────────────────────────────┘
 ```
 
-| Component | Role | State |
+### Components at a glance
+
+| Component | Role | Persistent State |
 | :--- | :--- | :--- |
-| **Observatory** | Event ingest and NATS relay | `events.db` |
-| **Hippocampus** | Episodic and causal memory | `hippocampus.kuzu` |
-| **Prefrontal Cortex** | Hypothesis generation | `hypotheses.db` |
-| **Basal Ganglia** | Policy gated action arbiter | `pending_approvals.json` |
+| 👁️ **Observatory** | Event ingest and NATS relay | `events.db` |
+| 🧠 **Hippocampus** | Episodic and causal memory | `hippocampus.kuzu` |
+| 💭 **Prefrontal Cortex** | Hypothesis generation | `hypotheses.db` |
+| ⚖️ **Basal Ganglia** | Policy-gated action arbiter | `pending_approvals.json` |
 
 ---
 
-## Quick start
+## 🚀 Quick start
 
 Deploy CEREBELLUM in about five minutes.
 
-### 1. Clone and install
+### 1️⃣ Clone and install
+
 ```bash
-git clone https://github.com/you/cerebellum ~/.openclaw/cerebellum
+git clone https://github.com/jcartu/cerebellum ~/.openclaw/cerebellum
 cd ~/.openclaw/cerebellum
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### 2. Configure secrets
+### 2️⃣ Configure secrets
+
 Create a `.env` file with your keys. Use literal values without shell expansion.
+
 ```bash
 cat > .env <<'EOF'
 OPENROUTER_API_KEY=sk-or-v1-...
@@ -118,26 +130,28 @@ EOF
 chmod 0600 .env
 ```
 
-### 3. Install services
+### 3️⃣ Install services
+
 ```bash
 sudo cp services/*.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now cerebellum-observatory cerebellum-cortex
 ```
 
-### 4. Verify
+### 4️⃣ Verify
+
 ```bash
 curl -H "Authorization: Bearer $DASHBOARD_TOKEN" http://127.0.0.1:18790/healthz
 ```
 
-**Prerequisites**: NATS server with JetStream, Python 3.11+, KuzuDB, and an OpenRouter account.
+> **Prerequisites** — NATS server with JetStream, Python 3.11+, KuzuDB, and an OpenRouter account.
 
 ---
 
-## Configuration
+## ⚙️ Configuration
 
-### `config.json`
-This file is read by every component.
+### `config.json` — read by every component
+
 ```json
 {
   "nats": { "host": "localhost", "port": 4222, "jetstream_domain": "" },
@@ -148,8 +162,8 @@ This file is read by every component.
 }
 ```
 
-### `policy.yaml`
-The rulebook for the Basal Ganglia.
+### `policy.yaml` — the rulebook for the Basal Ganglia
+
 ```yaml
 global:
   enabled: true
@@ -173,25 +187,25 @@ stage_notify:
 
 ---
 
-## Security features
+## 🔒 Security features
 
-CEREBELLUM is paranoid by default. If an agent can act on its own, it must fail closed.
+CEREBELLUM is **paranoid by default**. If an agent can act on its own, it must fail closed.
 
-*   **SSRF Protection**: Every outbound URL is resolved once and checked against a public IP allowlist. Connections are pinned to the validated IP. Redirects are refused.
-*   **Path Traversal**: All file reads resolve symlinks and check against a root allowlist. Forbidden paths like `/etc` or `.env` are hard denied.
-*   **Tool Allowlist**: Only tools in your `auto_execute` list run without approval. Forbidden tools never run.
-*   **Kill Switch**: A file backed, cross process lock stops everything instantly. You can toggle it from Telegram or the dashboard.
-*   **Budget Caps**: We use a sliding window for action rates and a daily spend cap for LLMs.
-*   **Telegram Auth**: We use secret tokens and user ID allowlists. SQLite tracks update IDs to prevent replay attacks.
-*   **Dashboard Auth**: Bearer tokens are required. The dashboard binds to loopback by default.
-*   **Response Caps**: Every HTTP response has a byte limit to prevent memory exhaustion.
-*   **Atomic Writes**: State files are written using temp files and fsync to prevent corruption.
+- 🛡️ **SSRF Protection** — Every outbound URL is resolved once and checked against a public IP allowlist. Connections are pinned to the validated IP. Redirects are refused.
+- 📁 **Path Traversal Defense** — All file reads resolve symlinks and check against a root allowlist. Forbidden paths like `/etc` or `.env` are hard-denied.
+- ✅ **Tool Allowlist** — Only tools in your `auto_execute` list run without approval. Forbidden tools never run.
+- 🛑 **Kill Switch** — A file-backed, cross-process lock stops everything instantly. Toggle it from Telegram or the dashboard.
+- 💰 **Budget Caps** — Sliding window for action rates, daily spend cap for LLMs.
+- 🔑 **Telegram Auth** — Secret tokens and user-ID allowlists. SQLite tracks update IDs to prevent replay attacks.
+- 🔐 **Dashboard Auth** — Bearer tokens required. Binds to loopback by default.
+- 📏 **Response Caps** — Every HTTP response has a byte limit to prevent memory exhaustion.
+- 💾 **Atomic Writes** — State files use temp files and fsync to prevent corruption.
 
 ---
 
-## API endpoints
+## 🌐 API endpoints
 
-All routes except healthz require `Authorization: Bearer $DASHBOARD_TOKEN`.
+All routes except `healthz` require `Authorization: Bearer $DASHBOARD_TOKEN`.
 
 | Method | Path | Description |
 | :--- | :--- | :--- |
@@ -205,9 +219,10 @@ All routes except healthz require `Authorization: Bearer $DASHBOARD_TOKEN`.
 
 ---
 
-## Event schema
+## 📦 Event schema
 
-Events follow a standard shape in SQLite and NATS.
+Events follow a standard shape across SQLite and NATS:
+
 ```json
 {
   "id": "uuid4",
@@ -219,32 +234,43 @@ Events follow a standard shape in SQLite and NATS.
 }
 ```
 
-**Common types**:
-*   `cerebellum.hypothesis`: A new proposal.
-*   `cerebellum.action`: A decision made by the arbiter.
-*   `cerebellum.execution`: Result of an automated task.
-*   `cerebellum.approval.staged`: Waiting for your input on Telegram.
-*   `cerebellum.kill_switch`: The system was halted or resumed.
+### Common event types
+
+| Type | Meaning |
+| :--- | :--- |
+| `cerebellum.hypothesis` | A new proposal |
+| `cerebellum.action` | A decision made by the arbiter |
+| `cerebellum.execution` | Result of an automated task |
+| `cerebellum.approval.staged` | Waiting for your input on Telegram |
+| `cerebellum.kill_switch` | System was halted or resumed |
 
 ---
 
-## Troubleshooting
+## 🔧 Troubleshooting
 
 | Symptom | Likely cause | Fix |
 | :--- | :--- | :--- |
-| NATS connection error | Server down or token wrong | Check `systemctl status nats-server` and your token. |
-| Dashboard returns 401 | Token mismatch | Verify `DASHBOARD_TOKEN` in your `.env` file. |
-| No hypotheses appearing | API key or quota issue | Check `journalctl -u cerebellum-cortex -f` for errors. |
-| Telegram buttons fail | Webhook not set | Run the `setWebhook` curl command manually. |
-| Everything is discarded | Policy is too strict | Lower the `min_confidence` in your `policy.yaml`. |
-| Kill switch stuck | Flag file exists | Delete or update the `kill_switch.flag` file. |
+| NATS connection error | Server down or wrong token | Check `systemctl status nats-server` and your token |
+| Dashboard returns 401 | Token mismatch | Verify `DASHBOARD_TOKEN` in your `.env` |
+| No hypotheses appearing | API key or quota issue | Check `journalctl -u cerebellum-cortex -f` |
+| Telegram buttons fail | Webhook not set | Run the `setWebhook` curl command manually |
+| Everything is discarded | Policy too strict | Lower `min_confidence` in `policy.yaml` |
+| Kill switch stuck | Flag file exists | Delete or update `kill_switch.flag` |
 
 ---
 
-## License and contributing
+## 📜 License and contributing
 
-CEREBELLUM is unreleased software. It handles sensitive credentials and can modify your system. Only deploy it on hosts you control.
+> ⚠️ **CEREBELLUM is unreleased software.** It handles sensitive credentials and can modify your system. Deploy it only on hosts you control.
 
-We welcome contributions. Please read the forthcoming `CONTRIBUTING.md` before submitting a pull request.
+Contributions are welcome. Please read the forthcoming `CONTRIBUTING.md` before opening a pull request.
 
-*"Memory without inference is a logbook. Inference without memory is a stranger at your door every morning. CEREBELLUM is neither."*
+---
+
+<div align="center">
+
+*"Memory without inference is a logbook.*
+*Inference without memory is a stranger at your door every morning.*
+**CEREBELLUM is neither."**
+
+</div>
