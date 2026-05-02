@@ -16,7 +16,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
-from collections import deque
+from collections import Counter, deque
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from http.client import HTTPSConnection
@@ -25,6 +25,7 @@ from typing import Any
 
 import yaml
 
+from cerebellum.http_client import safe_post
 from cerebellum.http_safe import NoRedirectHandler, _safe_opener
 
 logger = logging.getLogger(__name__)
@@ -38,6 +39,24 @@ OPENCLAW_FALLBACK_BINARY_PATHS = (
     Path("/usr/bin/openclaw"),
 )
 COSTLY_AUTO_EXECUTE_TOOLS = {"model.call", "web.search"}
+
+# Execution cost estimates per tool (USD)
+TOOL_COST_ESTIMATES: dict[str, float] = {
+    "http.get": 0.0,
+    "web.search": 0.005,
+    "file.read": 0.0,
+    "memory.query": 0.001,
+    "model.call": 0.01,
+    "notification.send": 0.0,
+    "notification.summarize": 0.001,
+    "proposal.snooze": 0.0,
+    "rasputin.search": 0.001,
+    "rasputin.recent_facts": 0.001,
+    "rasputin.entity_lookup": 0.001,
+    "rasputin.episode_summary": 0.001,
+    "rasputin.commit_fact": 0.001,
+    "rasputin.reflect": 0.01,
+}
 SENSITIVE_HYPOTHESIS_FIELD_TOKENS = (
     "api_key",
     "api_keys",
@@ -816,29 +835,45 @@ class PolicyArbiter:
 
     def _execute_step(self, tool_name: str, step: dict[str, Any]) -> dict[str, Any]:
         handlers = {
-            "browser.screenshot": self._handle_browser_screenshot,
             "http.get": self._handle_http_get,
             "web.search": self._handle_web_search,
             "file.read": self._handle_file_read,
             "memory.query": self._handle_memory_query,
             "model.call": self._handle_model_call,
             "notification.send": self._handle_notification_send,
+            "notification.summarize": self._handle_notification_summarize,
+            "proposal.snooze": self._handle_proposal_snooze,
+            "rasputin.search": self._handle_rasputin_search,
+            "rasputin.recent_facts": self._handle_rasputin_recent_facts,
+            "rasputin.entity_lookup": self._handle_rasputin_entity_lookup,
+            "rasputin.episode_summary": self._handle_rasputin_episode_summary,
+            "rasputin.commit_fact": self._handle_rasputin_commit_fact,
+            "rasputin.reflect": self._handle_rasputin_reflect,
         }
-        if tool_name not in handlers:
-            raise ValueError(f"Unsupported auto-execute tool: {tool_name}")
-        return handlers[tool_name](step)
-
-    def _handle_browser_screenshot(self, step: dict[str, Any]) -> dict[str, Any]:
-        url = str(step.get("url") or "")
-        output_path = str(step.get("output_path") or self.state_dir / f"{uuid.uuid4()}.png")
-        return {
-            "status": "deferred",
-            "tool": "browser.screenshot",
-            "url": url,
-            "output_path": output_path,
-            "note": "CDP integration not configured in Phase 4 runtime; step recorded for external executor.",
-        }
-
+        handler = handlers.get(tool_name)
+        if handler is None:
+            return {
+                "status": "error",
+                "tool": tool_name,
+                "error": f"No handler for tool: {tool_name}",
+                "estimated_execution_cost_usd": 0.0,
+            }
+        cost = TOOL_COST_ESTIMATES.get(tool_name, 0.0)
+        try:
+            result = handler(step)
+            return {
+                "status": "ok",
+                "tool": tool_name,
+                "result": result,
+                "estimated_execution_cost_usd": cost,
+            }
+        except Exception as e:
+            return {
+                "status": "error",
+                "tool": tool_name,
+                "error": str(e),
+                "estimated_execution_cost_usd": cost,
+            }
     def _handle_http_get(self, step: dict[str, Any]) -> dict[str, Any]:
         url = str(step.get("url") or "")
         if not url:
@@ -989,6 +1024,175 @@ class PolicyArbiter:
             raise ValueError("notification.send requires text")
         result = self._send_telegram_message(text)
         return {"status": "ok", "tool": "notification.send", "result": result}
+
+    # -----------------------------------------------------------------------
+    # New handlers (Phase 4)
+    # -----------------------------------------------------------------------
+
+    def _handle_notification_summarize(self, step: dict[str, Any]) -> dict[str, Any]:
+        """Summarize recent events and post to Telegram.
+
+        Args:
+            step: Step payload with optional 'hours' (default 1) and 'channel'.
+
+        Returns:
+            Execution result dict.
+        """
+        hours = float(step.get("hours", 1))
+        since = datetime.now(UTC) - timedelta(hours=hours)
+
+        events = self.event_bus.query(since=since, limit=50)
+        if not events:
+            return {"status": "ok", "tool": "notification.summarize", "result": {"message": "No recent events"}}
+
+        # Build summary text
+        type_counts: Counter[str] = Counter()
+        for event in events:
+            type_counts[event.get("type", "unknown")] += 1
+
+        summary_lines = [f"📊 Events in last {hours}h: {len(events)} total"]
+        for etype, count in type_counts.most_common(5):
+            summary_lines.append(f"  • {etype}: {count}")
+        summary_text = "\n".join(summary_lines)
+
+        result = self._send_telegram_message(summary_text)
+        return {"status": "ok", "tool": "notification.summarize", "result": result}
+
+    def _handle_proposal_snooze(self, step: dict[str, Any]) -> dict[str, Any]:
+        """Snooze a proposal for later review.
+
+        Args:
+            step: Step payload with 'proposal_id' and optional 'duration_minutes'.
+
+        Returns:
+            Execution result dict.
+        """
+        proposal_id = str(step.get("proposal_id", ""))
+        if not proposal_id:
+            raise ValueError("proposal.snooze requires proposal_id")
+        duration = int(step.get("duration_minutes", 60))
+        snooze_until = datetime.now(UTC) + timedelta(minutes=duration)
+
+        return {
+            "status": "ok",
+            "tool": "proposal.snooze",
+            "result": {
+                "proposal_id": proposal_id,
+                "snoozed_until": snooze_until.isoformat(),
+                "duration_minutes": duration,
+            },
+        }
+
+    # RASPUTIN MCP handlers (port 8808)
+    RASPUTIN_MCP_URL = "http://localhost:8808"
+
+    def _handle_rasputin_search(self, step: dict[str, Any]) -> dict[str, Any]:
+        """Query RASPUTIN memory by string.
+
+        Args:
+            step: Step payload with 'query' string.
+
+        Returns:
+            Execution result dict.
+        """
+        query = str(step.get("query", ""))
+        if not query:
+            raise ValueError("rasputin.search requires query")
+        return self._call_rasputin_mcp("search", {"query": query})
+
+    def _handle_rasputin_recent_facts(self, step: dict[str, Any]) -> dict[str, Any]:
+        """List recent RASPUTIN facts.
+
+        Args:
+            step: Step payload with optional 'limit' (default 10).
+
+        Returns:
+            Execution result dict.
+        """
+        limit = int(step.get("limit", 10))
+        return self._call_rasputin_mcp("recent_facts", {"limit": limit})
+
+    def _handle_rasputin_entity_lookup(self, step: dict[str, Any]) -> dict[str, Any]:
+        """Resolve an entity in RASPUTIN.
+
+        Args:
+            step: Step payload with 'entity' name.
+
+        Returns:
+            Execution result dict.
+        """
+        entity = str(step.get("entity", ""))
+        if not entity:
+            raise ValueError("rasputin.entity_lookup requires entity")
+        return self._call_rasputin_mcp("entity_lookup", {"entity": entity})
+
+    def _handle_rasputin_episode_summary(self, step: dict[str, Any]) -> dict[str, Any]:
+        """Fetch RASPUTIN's view of recent activity.
+
+        Args:
+            step: Step payload with optional 'hours' (default 24).
+
+        Returns:
+            Execution result dict.
+        """
+        hours = int(step.get("hours", 24))
+        return self._call_rasputin_mcp("episode_summary", {"hours": hours})
+
+    def _handle_rasputin_commit_fact(self, step: dict[str, Any]) -> dict[str, Any]:
+        """Write a fact to RASPUTIN (requires approval, never auto-execute).
+
+        Args:
+            step: Step payload with 'fact' string.
+
+        Returns:
+            Execution result dict.
+        """
+        fact = str(step.get("fact", ""))
+        if not fact:
+            raise ValueError("rasputin.commit_fact requires fact")
+        return self._call_rasputin_mcp("commit_fact", {"fact": fact})
+
+    def _handle_rasputin_reflect(self, step: dict[str, Any]) -> dict[str, Any]:
+        """Trigger a reflection cycle in RASPUTIN.
+
+        Args:
+            step: Step payload with optional 'prompt'.
+
+        Returns:
+            Execution result dict.
+        """
+        prompt = str(step.get("prompt", ""))
+        return self._call_rasputin_mcp("reflect", {"prompt": prompt})
+
+    def _call_rasputin_mcp(self, tool: str, params: dict[str, Any]) -> dict[str, Any]:
+        """Call a RASPUTIN MCP tool via HTTP.
+
+        Args:
+            tool: MCP tool name.
+            params: Tool parameters.
+
+        Returns:
+            Execution result dict.
+        """
+        payload = {"tool": tool, "params": params}
+        try:
+            response = safe_post(
+                f"{self.RASPUTIN_MCP_URL}/tools/call",
+                json=payload,
+                timeout=30.0,
+            )
+            return {
+                "status": "ok",
+                "tool": f"rasputin.{tool}",
+                "result": response.json(),
+            }
+        except Exception as exc:
+            logger.error("RASPUTIN MCP call failed for %s: %s", tool, exc)
+            return {
+                "status": "error",
+                "tool": f"rasputin.{tool}",
+                "error": str(exc),
+            }
 
     def _send_telegram_message(
         self, text: str, keyboard: list[list[dict[str, str]]] | None = None

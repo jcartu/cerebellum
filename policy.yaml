@@ -12,13 +12,19 @@ auto_execute:
   min_confidence: 0.85
   max_cost: 0.3
   required_reversibility: ["full", "partial"]
-  allowed_tools:
-    - "http.get"
-    - "web.search"
-    - "file.read"
-    - "memory.query"
-    - "model.call"
-    - "notification.send"
+allowed_tools:
+  - "http.get"
+  - "web.search"
+  - "file.read"
+  - "memory.query"
+  - "model.call"
+  - "notification.send"
+  - "notification.summarize"
+  - "proposal.snooze"
+  - "rasputin.search"
+  - "rasputin.recent_facts"
+  - "rasputin.entity_lookup"
+  - "rasputin.episode_summary"
 
 # Stage & notify: everything else that passes thresholds
 stage_notify:
@@ -45,3 +51,5 @@ forbidden_tools:
   - "system.exec"
   - "docker.kill"
   - "database.drop"
+  - "rasputin.commit_fact"
+  - "rasputin.reflect"
