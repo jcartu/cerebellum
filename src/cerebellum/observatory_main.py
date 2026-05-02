@@ -55,7 +55,7 @@ class ObservatoryService:
             await self._shutdown()
             return
 
-        import nats  # type: ignore
+        import nats  # type: ignore[unused-ignore]
 
         try:
             self._nats_client = await nats.connect("nats://127.0.0.1:4222")

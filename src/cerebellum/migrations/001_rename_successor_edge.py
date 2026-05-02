@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+from typing import Any
 
 logger = logging.getLogger(__name__)
 LEGACY_EDGE_LABEL = "Causal" + "Edge"
@@ -19,7 +20,7 @@ MIGRATION_NAME = "001_rename_successor_edge"
 
 def run(graph_dir: Path) -> None:
     """Apply migration. Idempotent."""
-    import kuzu  # type: ignore
+    import kuzu
 
     db_path = str(graph_dir / "db")
     if not graph_dir.exists():
@@ -37,7 +38,7 @@ def run(graph_dir: Path) -> None:
     try:
         tables = [
             row[0]
-            for row in conn.execute("CALL db.show_tables()").get_as_dataframe().itertuples()
+            for row in conn.execute("CALL db.show_tables()").get_as_dataframe().itertuples()  # type: ignore[union-attr]
         ]
     except Exception:
         tables = []
@@ -78,7 +79,7 @@ def run(graph_dir: Path) -> None:
                        s.type AS source_type,
                        t.type AS target_type
                 """
-            ).get_as_dataframe()
+            ).get_as_dataframe()  # type: ignore[union-attr]
 
             migrated = 0
             for _, row in edges.iterrows():
@@ -126,7 +127,7 @@ def run(graph_dir: Path) -> None:
     logger.info("Migration 001 complete")
 
 
-def _record_migration(conn) -> None:
+def _record_migration(conn: Any) -> None:
     """Mark migration as applied."""
     try:
         tables = [
