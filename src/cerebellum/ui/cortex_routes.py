@@ -6,7 +6,7 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query
 
-from cerebellum.proposer import Hypothesis, Proposer
+from cerebellum.proposer import Proposer
 
 router = APIRouter(tags=["cerebellum-hypotheses"])
 

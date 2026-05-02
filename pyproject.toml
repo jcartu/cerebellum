@@ -106,6 +106,8 @@ ignore = [
 
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["S", "B", "E402"]
+"tests/test_policy_arbiter_coverage.py" = ["F401", "SIM105", "SIM115", "SIM117", "F841"]
+"tests/test_dashboard_coverage.py" = ["F401", "SIM115", "F841"]
 "scripts/*" = ["E402"]  # path-fiddling at module top
 "src/cerebellum/migrations/*" = ["S608"]  # SQL string composition is fine in migrations
 

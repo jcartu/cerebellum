@@ -252,7 +252,7 @@ class EpisodeStore:
             return []
 
         # Aggregate by event-type pair, keeping best lift + summing support
-        aggregated: dict[tuple[str, str], SuccessorPattern] = {}  # type: ignore[name-defined]
+        aggregated: dict[tuple[str, str], Any] = {}
         for pattern in patterns:
             key = (pattern.source.event_type, pattern.target.event_type)
             if key not in aggregated or pattern.lift > aggregated[key].lift:

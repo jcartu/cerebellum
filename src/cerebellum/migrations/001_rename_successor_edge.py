@@ -11,8 +11,8 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-
 from typing import Any
+
 logger = logging.getLogger(__name__)
 LEGACY_EDGE_LABEL = "Causal" + "Edge"
 MIGRATION_NAME = "001_rename_successor_edge"

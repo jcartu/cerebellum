@@ -128,7 +128,7 @@ def test_emit_with_none_payload_stores_none(event_bus):
     """emit with None payload stores None (no coercion)."""
     event_bus.emit("null.event", None)
     events = event_bus.query(limit=10)
-    ev = next(e for e in events if e["type"] == "null.event")
+    _ = next(e for e in events if e["type"] == "null.event")
 
 def test_config_load_missing_file(tmp_path):
     """EventBus raises FileNotFoundError when config is missing."""

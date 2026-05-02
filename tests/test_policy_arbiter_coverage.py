@@ -9,7 +9,7 @@ import os
 import tempfile
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from unittest.mock import MagicMock, patch, mock_open
+from unittest.mock import MagicMock, mock_open, patch
 
 import pytest
 
@@ -23,7 +23,7 @@ for path in (PROJECT_ROOT, SRC_DIR):
 
 os.environ.setdefault("DASHBOARD_TOKEN", "test-token")
 
-from cerebellum.policy_arbiter import (  # noqa: E402
+from cerebellum.policy_arbiter import (
     COSTLY_AUTO_EXECUTE_TOOLS,
     SENSITIVE_HYPOTHESIS_FIELD_TOKENS,
     TOOL_COST_ESTIMATES,
@@ -32,7 +32,6 @@ from cerebellum.policy_arbiter import (  # noqa: E402
     PolicyArbiter,
     RateLimiter,
 )
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -75,7 +74,10 @@ model_candidates:
     tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False)
     tmp.write(content)
     tmp.close()
-    return tmp.name
+    fd, path = tempfile.mkstemp(suffix=".yaml")
+    with os.fdopen(fd, "w") as f:
+        f.write(content)
+    return path
 
 
 def _make_arbiter(policy_path: str | None = None) -> PolicyArbiter:
