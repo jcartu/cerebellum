@@ -17,18 +17,19 @@ for path in (PROJECT_ROOT, SRC_DIR):
 os.environ.setdefault("DASHBOARD_TOKEN", "test-dashboard-token")
 
 SRC_MODULES = [
-    "src",
-    "src.arbiter",
-    "src.cortex",
-    "src.events",
-    "src.hippocampus",
-    "src.http_safe",
-    "src.observatory_main",
-    "src.ui",
-    "src.ui.cortex_routes",
-    "src.ui.dashboard",
-    "src.instruments",
-    "src.instruments.cron_instrument",
+    "cerebellum",
+    "cerebellum.arbiter",
+    "cerebellum.cortex",
+    "cerebellum.events",
+    "cerebellum.hippocampus",
+    "cerebellum.http_safe",
+    "cerebellum.observatory_main",
+    "cerebellum.models",
+    "cerebellum.ui",
+    "cerebellum.ui.cortex_routes",
+    "cerebellum.ui.dashboard",
+    "cerebellum.instruments",
+    "cerebellum.instruments.cron_instrument",
 ]
 
 SCRIPT_MODULES = {

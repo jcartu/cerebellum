@@ -8,14 +8,14 @@ import os
 import sqlite3
 import threading
 import uuid
+from collections.abc import Callable
 from concurrent.futures import Future, wait
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from nats.aio.client import Client as NATS
 from nats.aio.msg import Msg
-
 
 logger = logging.getLogger(__name__)
 
@@ -62,7 +62,7 @@ class CerebellumEventEmitter:
         event_id = str(uuid.uuid4())
         event = {
             "id": event_id,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "timestamp": datetime.now(UTC).isoformat(),
             "type": event_type,
             "payload": payload,
             "actor": actor,
@@ -109,7 +109,7 @@ class CerebellumEventEmitter:
             raise ValueError(f"Event payload missing required keys: {', '.join(missing)}")
         normalized_event = {
             "id": str(event["id"]),
-            "timestamp": str(event["timestamp"] or datetime.now(timezone.utc).isoformat()),
+            "timestamp": str(event["timestamp"] or datetime.now(UTC).isoformat()),
             "type": str(event["type"] or "unknown"),
             "payload": event["payload"] if isinstance(event["payload"], dict) else {},
             "actor": str(event["actor"] or "system"),
@@ -133,7 +133,7 @@ class CerebellumEventEmitter:
             params.extend(types)
         if since:
             conditions.append("timestamp >= ?")
-            params.append(since.astimezone(timezone.utc).isoformat())
+            params.append(since.astimezone(UTC).isoformat())
 
         if conditions:
             sql += " WHERE " + " AND ".join(conditions)
@@ -312,10 +312,10 @@ class CerebellumEventEmitter:
             insert_clause = f"INSERT {insert_mode}".strip()
             with self._db_lock:
                 self._sqlite.execute(
-                    """
+                    f"""
                     {insert_clause} INTO events (id, timestamp, type, payload, actor, context)
                     VALUES (?, ?, ?, ?, ?, ?)
-                    """.format(insert_clause=insert_clause),
+                    """,
                     (
                         event["id"],
                         event["timestamp"],

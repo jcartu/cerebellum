@@ -1,15 +1,9 @@
 #!/usr/bin/env python3
 """Hypothesis generation cron script — wires emitter + hippocampus for full context."""
 import logging
-import sys
 from pathlib import Path
 
-BASE_DIR = Path(__file__).resolve().parent.parent
-SRC_DIR = BASE_DIR / "src"
-if str(SRC_DIR) not in sys.path:
-    sys.path.insert(0, str(SRC_DIR))
-
-from cortex import PrefrontalCortex  # noqa: E402
+from cerebellum.cortex import PrefrontalCortex
 
 logger = logging.getLogger(__name__)
 
@@ -21,12 +15,12 @@ def main() -> int:
     )
 
     try:
-        config_path = str(BASE_DIR / "config.json")
+        config_path = str(Path(__file__).resolve().parents[1] / "config.json")
 
         # Wire emitter for event context
         emitter = None
         try:
-            from events import CerebellumEventEmitter  # noqa: F401
+            from cerebellum.events import CerebellumEventEmitter
 
             emitter = CerebellumEventEmitter(config_path)
             logger.info("Emitter loaded")
@@ -38,7 +32,7 @@ def main() -> int:
         # Wire hippocampus for episode context
         hippocampus = None
         try:
-            from hippocampus import Hippocampus  # noqa: F401
+            from cerebellum.hippocampus import Hippocampus
 
             hippocampus = Hippocampus(config_path)
             logger.info("Hippocampus loaded")

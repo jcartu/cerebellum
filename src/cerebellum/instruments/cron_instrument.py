@@ -1,16 +1,10 @@
 from __future__ import annotations
 
 import time
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
-try:
-    from ..events import CerebellumEventEmitter
-except ImportError:  # pragma: no cover
-    import sys
-    from pathlib import Path
-
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-    from src.events import CerebellumEventEmitter
+from cerebellum.events import CerebellumEventEmitter
 
 
 class CronInstrumenter:

@@ -10,12 +10,10 @@ import types
 from pathlib import Path
 from typing import Any
 
-BASE_DIR = Path(__file__).resolve().parent.parent
-SRC_DIR = BASE_DIR / "src"
-if str(SRC_DIR) not in sys.path:
-    sys.path.insert(0, str(SRC_DIR))
+BASE_DIR = Path(__file__).resolve().parent
+SRC_DIR = BASE_DIR / "src" / "cerebellum"
 
-from arbiter import BasalGanglia  # noqa: E402
+from cerebellum.arbiter import BasalGanglia
 
 logger = logging.getLogger(__name__)
 STOP_REQUESTED = False
