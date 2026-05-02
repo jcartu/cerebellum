@@ -2,11 +2,10 @@
 from __future__ import annotations
 
 import json
-import os
 import sqlite3
 import time
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -127,9 +126,10 @@ class TestRenderEvents:
 class TestRequestSourceIP:
     def test_ip_from_x_forwarded_for(self, monkeypatch):
         monkeypatch.setenv("DASHBOARD_TOKEN", "test-token")
-        import cerebellum.ui.dashboard as dash
         from fastapi import Request
         from starlette.datastructures import Address
+
+        import cerebellum.ui.dashboard as dash
         mock_request = MagicMock(spec=Request)
         mock_request.headers = {"X-Forwarded-For": "1.2.3.4, 5.6.7.8"}
         mock_request.client = Address("127.0.0.1", 8080)
@@ -138,9 +138,10 @@ class TestRequestSourceIP:
 
     def test_ip_from_client(self, monkeypatch):
         monkeypatch.setenv("DASHBOARD_TOKEN", "test-token")
-        import cerebellum.ui.dashboard as dash
         from fastapi import Request
         from starlette.datastructures import Address
+
+        import cerebellum.ui.dashboard as dash
         mock_request = MagicMock(spec=Request)
         mock_request.headers = {}
         mock_request.client = Address("192.168.1.1", 12345)
@@ -149,8 +150,9 @@ class TestRequestSourceIP:
 
     def test_ip_unknown(self, monkeypatch):
         monkeypatch.setenv("DASHBOARD_TOKEN", "test-token")
-        import cerebellum.ui.dashboard as dash
         from fastapi import Request
+
+        import cerebellum.ui.dashboard as dash
         mock_request = MagicMock(spec=Request)
         mock_request.headers = {}
         mock_request.client = None

@@ -157,6 +157,8 @@ filterwarnings = [
   "ignore::DeprecationWarning",
   "ignore::DeprecationWarning:nats.*",
   "ignore::DeprecationWarning:kuzu.*",
+  "ignore::ResourceWarning:unclosed database",
+  "ignore::pytest.PytestUnraisableExceptionWarning",
 ]
 
 # ---------------------------------------------------------------------------

@@ -10,8 +10,6 @@ from __future__ import annotations
 
 import re
 
-import pytest
-
 from cerebellum.episode_store import EpisodeStore
 
 

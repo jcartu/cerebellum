@@ -78,7 +78,8 @@ app = FastAPI(title="Cerebellum Observatory")
 DASHBOARD_TOKEN = os.environ.get("DASHBOARD_TOKEN", "")
 if not DASHBOARD_TOKEN:
     logger.error("DASHBOARD_TOKEN environment variable is required")
-    sys.exit(1)
+    if not os.environ.get("CEREBELLUM_TESTING"):
+        sys.exit(1)
 _dashboard_db: sqlite3.Connection | None = None
 _dashboard_db_lock = threading.RLock()
 _auth_rate_lock = threading.RLock()

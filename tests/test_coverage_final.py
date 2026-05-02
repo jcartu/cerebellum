@@ -8,13 +8,11 @@ from __future__ import annotations
 
 import asyncio
 import json
-import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -141,7 +139,6 @@ class TestEventBusQuerySince:
             "id": "q-2", "timestamp": "2025-01-02T00:00:00",
             "type": "t", "payload": {}, "actor": "t", "context": {},
         })
-        from datetime import UTC, datetime
         since = datetime(2025, 1, 1, 12, 0, 0, tzinfo=UTC)
         results = emitter.query(since=since, limit=10)
         # Should return events after since
@@ -426,7 +423,6 @@ class TestEventBusWaitForInflight:
     """Cover lines 352-355."""
 
     def test_wait_for_inflight_with_pending(self, emitter):
-        import asyncio
         loop = asyncio.new_event_loop()
         fut = asyncio.run_coroutine_threadsafe(asyncio.sleep(10), loop)
         with emitter._inflight_lock:
@@ -434,10 +430,9 @@ class TestEventBusWaitForInflight:
         result = emitter._wait_for_inflight_publishes(timeout_seconds=0.01)
         assert result > 0
         fut.cancel()
-        try:
+        import contextlib
+        with contextlib.suppress(asyncio.CancelledError):
             loop.run_until_complete(asyncio.sleep(0))
-        except asyncio.CancelledError:
-            pass
         loop.close()
 
 

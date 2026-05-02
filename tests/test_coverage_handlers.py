@@ -7,16 +7,11 @@ to push global coverage from ~77% to 80%.
 from __future__ import annotations
 
 import json
-import math
-import os
 import sqlite3
-import tempfile
-from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -238,7 +233,7 @@ class TestEvaluationEdgeCases:
 
 class TestHandleHttpGet:
     def test_http_get_missing_url(self, arbiter):
-        with pytest.raises(ValueError, match="http.get requires a url"):
+        with pytest.raises(ValueError, match=r"http\.get requires a url"):
             arbiter._handle_http_get({})
 
     def test_http_get_valid_url(self, arbiter):
@@ -276,7 +271,7 @@ class TestHandleHttpGet:
 
 class TestHandleWebSearch:
     def test_web_search_missing_query(self, arbiter):
-        with pytest.raises(ValueError, match="web.search requires a query"):
+        with pytest.raises(ValueError, match=r"web\.search requires a query"):
             arbiter._handle_web_search({})
 
     def test_web_search_no_api_key(self, arbiter, monkeypatch):
@@ -335,7 +330,7 @@ class TestHandleMemoryQuery:
 
     def test_memory_query_missing_vector(self, arbiter, monkeypatch):
         monkeypatch.setenv("QDRANT_URL", "http://127.0.0.1:6333")
-        with pytest.raises(ValueError, match="memory.query requires a vector payload"):
+        with pytest.raises(ValueError, match=r"memory\.query requires a vector payload"):
             arbiter._handle_memory_query({"collection": "test"})
 
 
@@ -363,7 +358,7 @@ class TestHandleModelCall:
 
 class TestHandleNotificationSend:
     def test_notification_send_missing_text(self, arbiter):
-        with pytest.raises(ValueError, match="notification.send requires text"):
+        with pytest.raises(ValueError, match=r"notification\.send requires text"):
             arbiter._handle_notification_send({})
 
 

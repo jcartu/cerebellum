@@ -6,7 +6,6 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
-from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 

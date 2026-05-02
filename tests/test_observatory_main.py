@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import tempfile
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -48,7 +47,7 @@ class TestObservatoryServiceSignalHandlers:
     async def test_install_signal_handlers(self):
         from cerebellum.observatory_main import ObservatoryService
         svc = ObservatoryService()
-        loop = asyncio.get_running_loop()
+        asyncio.get_running_loop()
         svc._install_signal_handlers()
         # No exception means handlers installed successfully
         assert svc.stop_requested is False

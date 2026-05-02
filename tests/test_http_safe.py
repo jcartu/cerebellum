@@ -79,7 +79,7 @@ class TestNoRedirectHandler:
 
 class TestSafeOpener:
     def test_safe_opener_has_no_redirect_handler(self):
-        from cerebellum.http_safe import NoRedirectHandler, _safe_opener
+        from cerebellum.http_safe import _safe_opener
         handler_types = [type(h).__name__ for h in _safe_opener.handlers]
         assert "NoRedirectHandler" in handler_types
 

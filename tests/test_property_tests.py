@@ -9,15 +9,8 @@ Tests:
 
 from __future__ import annotations
 
-import threading
-import time
-from datetime import UTC, datetime
-from pathlib import Path
-from unittest.mock import MagicMock, patch
-
-import pytest
-from hypothesis import given, settings, strategies as st
-
+from hypothesis import given, settings
+from hypothesis import strategies as st
 
 # ---------------------------------------------------------------------------
 # RateLimiter property tests
@@ -124,9 +117,7 @@ class TestCypherFilterProperties:
             r'(?:DELETE|DROP|INSERT|UPDATE|CREATE|ALTER|MERGE|CALL|DETACH|ATTACH|REINDEX|VACUUM|PRAGMA|IMPORT|EXPORT)',
             re.IGNORECASE,
         )
-        if dangerous_pattern.search(stripped):
-            return False
-        return True
+        return not dangerous_pattern.search(stripped)
 
     @given(query=st.text(min_size=1, max_size=200, alphabet=st.characters(
         min_codepoint=32, max_codepoint=126,
@@ -202,7 +193,6 @@ class TestCoerceOptionalFloatProperties:
     @settings(max_examples=100, deadline=None)
     def test_valid_positive_returns_value(self, value: float) -> None:
         """Positive finite floats are returned as-is."""
-        from cerebellum.policy_arbiter import PolicyArbiter
         # We need a minimal arbiter instance - use the fixture
         # Since we can't easily create one in hypothesis, test the logic directly
         import math
@@ -214,7 +204,6 @@ class TestCoerceOptionalFloatProperties:
     @settings(max_examples=50, deadline=None)
     def test_negative_returns_none(self, value: float) -> None:
         """Negative values should be rejected by _coerce_optional_float."""
-        import math
         assert value < 0.0 or value == 0.0
 
 
@@ -232,8 +221,6 @@ class TestExtractToolsProperties:
     @settings(max_examples=50, deadline=None)
     def test_extract_tools_returns_list(self, tools: list[str]) -> None:
         """_extract_tools always returns a list."""
-        from cerebellum.policy_arbiter import PolicyArbiter
         # Test the logic: if hypothesis has no plan, tools should be empty
-        hypothesis = {}
         # We can't easily test with real arbiter, but we can verify the type
         assert isinstance(tools, list)

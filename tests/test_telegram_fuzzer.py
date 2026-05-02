@@ -12,9 +12,8 @@ import re
 import string
 import time
 
-import pytest
-from hypothesis import given, settings, strategies as st
-
+from hypothesis import given, settings
+from hypothesis import strategies as st
 
 HYPOTHESIS_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 
