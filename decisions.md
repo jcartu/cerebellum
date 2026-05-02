@@ -96,7 +96,6 @@ For each phase, fill out the section before merging to `main` and tagging `phase
 ---
 
 ## Phase 1 — Rebrand and honesty
-## Phase 1 — Rebrand and honesty
 
 - **Started:** 2026-05-02
 - **Completed:** 2026-05-03
