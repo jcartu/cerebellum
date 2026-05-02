@@ -41,11 +41,11 @@ def _make_event(event_type: str, ts_offset_hours: float = 0.0, entities: list[st
 def test_prefixspan_finds_simple_pairwise():
     """PrefixSpan recovers A→B when it appears frequently."""
     events = []
-    # 10 sequences: error → restart
+    # 10 independent sequences: error → restart, each pair 2h apart
     for i in range(10):
         events.extend([
-            _make_event("cron.error", ts_offset_hours=(i + 0.1)),
-            _make_event("cron.restart", ts_offset_hours=(i + 0.05)),
+            _make_event("cron.error", ts_offset_hours=(i * 2.0)),
+            _make_event("cron.restart", ts_offset_hours=(i * 2.0 - 0.1)),
         ])
 
     patterns = mine_patterns(events, min_support=5, min_length=2, max_length=2)
@@ -58,11 +58,11 @@ def test_prefixspan_finds_simple_pairwise():
 def test_prefixspan_rejects_rare_patterns():
     """Patterns below min_support are rejected."""
     events = []
-    # Only 2 occurrences of A→B
+    # Only 2 occurrences of A→B, spread across separate sequences
     for i in range(2):
         events.extend([
-            _make_event("rare.a", ts_offset_hours=(i + 0.1)),
-            _make_event("rare.b", ts_offset_hours=(i + 0.05)),
+            _make_event("rare.a", ts_offset_hours=(i * 2.0)),
+            _make_event("rare.b", ts_offset_hours=(i * 2.0 - 0.1)),
         ])
 
     patterns = mine_patterns(events, min_support=5, min_length=2, max_length=2)
@@ -126,11 +126,11 @@ def test_lift_zero_total():
 
 def test_lift_rejected_below_threshold():
     """Patterns with lift < 1.5 are rejected."""
-    # Many events of type A and type B independently
+    # Many events of type A and type B independently, spread across sequences
     events = []
     for i in range(20):
-        events.append(_make_event("common.a", ts_offset_hours=(i * 0.1)))
-        events.append(_make_event("common.b", ts_offset_hours=(i * 0.1 - 0.01)))
+        events.append(_make_event("common.a", ts_offset_hours=(i * 1.0)))
+        events.append(_make_event("common.b", ts_offset_hours=(i * 1.0 - 0.01)))
 
     patterns = mine_patterns(events, min_support=3, lift_threshold=1.5)
     # All patterns should have lift >= 1.5
@@ -148,8 +148,8 @@ def test_entity_aware_mining():
     events = []
     # service=api produces errors, then service=api restarts — 10 times
     for i in range(10):
-        events.append(_make_event("cron.error", ts_offset_hours=(i + 0.1), entities=["api"]))
-        events.append(_make_event("cron.restart", ts_offset_hours=(i + 0.05), entities=["api"]))
+        events.append(_make_event("cron.error", ts_offset_hours=(i * 2.0), entities=["api"]))
+        events.append(_make_event("cron.restart", ts_offset_hours=(i * 2.0 - 0.1), entities=["api"]))
 
     patterns = mine_patterns(events, min_support=5, min_length=2, max_length=2)
     # Should find at least one pattern
@@ -159,10 +159,10 @@ def test_entity_aware_mining():
 def test_entity_differentiates_sources():
     """Different entities create different patterns."""
     events = []
-    # api errors → api restarts (10 times)
+    # api errors → api restarts (10 times, spread across sequences)
     for i in range(10):
-        events.append(_make_event("cron.error", ts_offset_hours=(i + 0.1), entities=["api"]))
-        events.append(_make_event("cron.restart", ts_offset_hours=(i + 0.05), entities=["api"]))
+        events.append(_make_event("cron.error", ts_offset_hours=(i * 2.0), entities=["api"]))
+        events.append(_make_event("cron.restart", ts_offset_hours=(i * 2.0 - 0.1), entities=["api"]))
 
     patterns = mine_patterns(events, min_support=5, min_length=2, max_length=2)
     found = [p for p in patterns if p.source.entity == "api"]
@@ -178,8 +178,8 @@ def test_shuffle_baseline_produces_lower_lift():
     """Shuffled data produces lower lift than real patterns."""
     events = []
     for i in range(15):
-        events.append(_make_event("cron.error", ts_offset_hours=(i + 0.1)))
-        events.append(_make_event("cron.restart", ts_offset_hours=(i + 0.05)))
+        events.append(_make_event("cron.error", ts_offset_hours=(i * 2.0)))
+        events.append(_make_event("cron.restart", ts_offset_hours=(i * 2.0 - 0.1)))
 
     real_patterns = mine_patterns(events, min_support=5, min_length=2, max_length=2)
     assert len(real_patterns) >= 1
@@ -338,26 +338,25 @@ def test_get_relevant_patterns_no_match():
 def test_integration_recover_planted_patterns():
     """Mine 3 known patterns from synthetic data, reject noise."""
     events = []
-    datetime.now(UTC)
 
     # Pattern 1: api error → api restart (support=15)
     for i in range(15):
-        events.append(_make_event("cron.error", ts_offset_hours=(i * 0.5), entities=["api"]))
-        events.append(_make_event("cron.restart", ts_offset_hours=(i * 0.5 - 0.1), entities=["api"]))
+        events.append(_make_event("cron.error", ts_offset_hours=(i * 2.0), entities=["api"]))
+        events.append(_make_event("cron.restart", ts_offset_hours=(i * 2.0 - 0.1), entities=["api"]))
 
     # Pattern 2: deploy → health_check (support=12)
     for i in range(12):
-        events.append(_make_event("deploy", ts_offset_hours=(i * 0.6), entities=["web"]))
-        events.append(_make_event("health_check", ts_offset_hours=(i * 0.6 - 0.05), entities=["web"]))
+        events.append(_make_event("deploy", ts_offset_hours=(i * 2.5), entities=["web"]))
+        events.append(_make_event("health_check", ts_offset_hours=(i * 2.5 - 0.1), entities=["web"]))
 
     # Pattern 3: gpu.oom → model.restart (support=8)
     for i in range(8):
-        events.append(_make_event("gpu.oom", ts_offset_hours=(i * 0.8)))
-        events.append(_make_event("model.restart", ts_offset_hours=(i * 0.8 - 0.05)))
+        events.append(_make_event("gpu.oom", ts_offset_hours=(i * 3.0)))
+        events.append(_make_event("model.restart", ts_offset_hours=(i * 3.0 - 0.1)))
 
     # Noise: random events
     for i in range(30):
-        events.append(_make_event("noise.event", ts_offset_hours=(i * 0.3)))
+        events.append(_make_event("noise.event", ts_offset_hours=(i * 1.5)))
 
     patterns = mine_patterns(events, min_support=5, min_length=2, max_length=4, lift_threshold=1.5)
 
@@ -381,7 +380,7 @@ def test_integration_no_false_positives_on_random():
     for i in range(100):
         import random
         et = random.choice(event_types)
-        events.append(_make_event(et, ts_offset_hours=(i * 0.1)))
+        events.append(_make_event(et, ts_offset_hours=(i * 1.0)))
 
     patterns = mine_patterns(events, min_support=5, min_length=2, max_length=2, lift_threshold=3.0)
     # With high lift threshold, random data should produce very few or no patterns
