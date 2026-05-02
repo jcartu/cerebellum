@@ -39,8 +39,10 @@ class CerebellumEventEmitter:
         self._js: Any | None = None
         self._nats_ready = False
         self._subscription_futures: list[Future[Any]] = []
+        self._subscription_futures_lock = threading.RLock()
+        self._max_subscription_futures = 128
         self._inflight_publishes: list[Future[Any]] = []
-        self._inflight_lock = threading.Lock()
+        self._inflight_lock = threading.RLock()
 
         self._connect_to_nats()
 
@@ -131,7 +133,15 @@ class CerebellumEventEmitter:
             return
 
         future = asyncio.run_coroutine_threadsafe(self._subscribe(callback), self._loop)
-        self._subscription_futures.append(future)
+        with self._subscription_futures_lock:
+            # Reap completed futures first to avoid unbounded growth.
+            self._subscription_futures = [
+                f for f in self._subscription_futures if not f.done()
+            ]
+            if len(self._subscription_futures) >= self._max_subscription_futures:
+                # Drop oldest reference if somehow at cap.
+                self._subscription_futures.pop(0)
+            self._subscription_futures.append(future)
 
     def close(self) -> None:
         try:
@@ -202,22 +212,51 @@ class CerebellumEventEmitter:
     async def _connect_to_nats_async(self) -> None:
         nats_config = self.config.get("nats", {})
         servers = [f"nats://{nats_config.get('host', 'localhost')}:{nats_config.get('port', 4222)}"]
+        auth_token = (
+            nats_config.get("auth_token")
+            or __import__("os").environ.get("CEREBELLUM_NATS_TOKEN", "")
+        ).strip()
+        if not auth_token:
+            raise RuntimeError(
+                "CEREBELLUM_NATS_TOKEN is not configured; refusing to connect to NATS unauthenticated"
+            )
 
-        try:
-            self._nc = NATS()
-            await self._nc.connect(servers=servers, connect_timeout=2, max_reconnect_attempts=2)
-            self._js = self._nc.jetstream(domain=nats_config.get("jetstream_domain") or None)
+        last_exc: Exception | None = None
+        for attempt in range(3):
             try:
-                await self._js.stream_info("CEREBELLUM_EVENTS")
-            except Exception:
-                await self._js.add_stream(name="CEREBELLUM_EVENTS", subjects=["cerebellum.events.>"])
-            self._nats_ready = True
-            logger.info("Connected to NATS JetStream at %s", servers[0])
-        except Exception as exc:
-            self._nc = None
-            self._js = None
-            self._nats_ready = False
-            raise RuntimeError(str(exc)) from exc
+                self._nc = NATS()
+                await self._nc.connect(
+                    servers=servers,
+                    connect_timeout=10,
+                    max_reconnect_attempts=5,
+                    token=auth_token,
+                )
+                self._js = self._nc.jetstream(domain=nats_config.get("jetstream_domain") or None)
+                try:
+                    await self._js.stream_info("CEREBELLUM_EVENTS")
+                except Exception:
+                    await self._js.add_stream(
+                        name="CEREBELLUM_EVENTS", subjects=["cerebellum.events.>"]
+                    )
+                self._nats_ready = True
+                logger.info(
+                    "Connected to NATS JetStream at %s (attempt %d)", servers[0], attempt + 1
+                )
+                return
+            except Exception as exc:
+                last_exc = exc
+                self._nc = None
+                self._js = None
+                self._nats_ready = False
+                delay = 2 ** attempt
+                logger.warning(
+                    "NATS connect attempt %d/3 failed: %s; retrying in %ds",
+                    attempt + 1,
+                    exc,
+                    delay,
+                )
+                await asyncio.sleep(delay)
+        raise RuntimeError(f"NATS connection failed after retries: {last_exc}")
 
     def _write_event(self, event: dict[str, Any]) -> None:
         try:

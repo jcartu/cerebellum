@@ -105,10 +105,15 @@ class ObservatoryService:
                 LOGGER.exception("Emitter shutdown failed")
 
     def _relay_event(self, topic: str, data: str) -> None:
-        """Relay NATS events through the single emitter (→ events.db + JetStream).
+        """Relay NATS events directly into SQLite, bypassing emit().
 
-        Drops events already emitted by the relay itself to prevent an
-        unbounded amplification loop (emit → NATS → handler → emit → ...).
+        Using emit() would (a) re-publish to NATS, creating a duplicate on the
+        bus that the subscriber receives again, and (b) in the degenerate case
+        where the original producer wrote to SQLite AND published to NATS, the
+        relayed copy duplicates the row with a new id. We instead parse the
+        original event (which already contains id/timestamp/type/payload/actor)
+        and write it to SQLite via the emitter's internal _write_event,
+        idempotently (INSERT OR IGNORE on the PK).
         """
         if self._emitter is None:
             return
@@ -117,17 +122,50 @@ class ObservatoryService:
                 parsed = json.loads(data)
             except Exception:
                 parsed = None
-            if isinstance(parsed, dict) and parsed.get("actor") == self.RELAY_ACTOR:
+
+            if not isinstance(parsed, dict):
+                LOGGER.debug("Relay dropped non-JSON payload on %s", topic)
                 return
 
-            event_type = topic.replace("cerebellum.events.", "", 1)
-            self._emitter.emit(
-                event_type,
-                payload={"subject": topic, "data": data},
-                actor=self.RELAY_ACTOR,
-            )
+            # Guard against historical loop via relay-origin events.
+            if parsed.get("actor") == self.RELAY_ACTOR:
+                return
+
+            # Validate/normalize the event shape.
+            event_id = str(parsed.get("id") or "").strip()
+            if not event_id:
+                LOGGER.debug("Relay dropped event without id on %s", topic)
+                return
+            event_type = str(parsed.get("type") or topic.replace("cerebellum.events.", "", 1))
+            timestamp = str(parsed.get("timestamp") or "")
+            actor = str(parsed.get("actor") or "unknown")
+            payload = parsed.get("payload") if isinstance(parsed.get("payload"), dict) else {}
+            context = parsed.get("context") if isinstance(parsed.get("context"), dict) else {}
+
+            # Direct idempotent SQLite insert, bypassing NATS publish.
+            import sqlite3
+            try:
+                with self._emitter._db_lock:
+                    self._emitter._sqlite.execute(
+                        """
+                        INSERT OR IGNORE INTO events
+                            (id, timestamp, type, payload, actor, context)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            event_id,
+                            timestamp,
+                            event_type,
+                            json.dumps(payload),
+                            actor,
+                            json.dumps(context),
+                        ),
+                    )
+                    self._emitter._sqlite.commit()
+            except sqlite3.Error:
+                LOGGER.exception("Relay SQLite write failed for %s", event_id)
         except Exception:
-            LOGGER.exception("Failed to relay NATS event %s through emitter", topic)
+            LOGGER.exception("Failed to relay NATS event %s", topic)
 
 
 async def _async_main() -> int:

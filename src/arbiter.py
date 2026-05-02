@@ -112,6 +112,7 @@ class BasalGanglia:
         self.feedback_file = self.state_dir / "arbiter_feedback.jsonl"
         self.state_file = self.state_dir / "arbiter_state.json"
         self.decisions_file = self.state_dir / "arbiter_decisions.jsonl"
+        self.kill_switch_file = self.state_dir / "kill_switch.flag"
         self.emitter = emitter
         self.cortex = cortex
         self._lock = threading.Lock()
@@ -298,6 +299,7 @@ class BasalGanglia:
 
     def toggle_kill_switch(self, enabled: bool) -> dict:
         self.kill_switch = enabled
+        self._write_kill_switch_file(enabled)
         self._persist_state()
         payload = {
             "kill_switch": self.kill_switch,
@@ -308,21 +310,76 @@ class BasalGanglia:
         return payload
 
     def _refresh_kill_switch_from_disk(self) -> None:
-        """Re-read kill-switch state from the shared state file.
+        """Re-read kill-switch state from the shared kill_switch.flag file.
 
         Enables cross-process halt: when the dashboard toggles the switch,
         the arbiter_loop process observes it on the next evaluate() cycle.
+        Uses advisory fcntl locking + atomic replace for race safety.
         """
         try:
-            state = self._load_json(self.state_file, default={})
-            disk_value = state.get("kill_switch")
+            disk_value = self._read_kill_switch_file()
             if isinstance(disk_value, bool):
                 self.kill_switch = disk_value
         except Exception:
-            logger.exception("Failed to refresh kill switch from %s", self.state_file)
+            logger.exception("Failed to refresh kill switch from %s", self.kill_switch_file)
 
-    def _validate_url(self, url: str) -> None:
-        """SSRF guard: only allow http/https to public hosts."""
+    def _read_kill_switch_file(self) -> bool | None:
+        import fcntl
+
+        path = self.kill_switch_file
+        if not path.exists():
+            return None
+        try:
+            with path.open("r", encoding="utf-8") as fh:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_SH)
+                try:
+                    raw = fh.read().strip()
+                finally:
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+            if not raw:
+                return None
+            data = json.loads(raw)
+            value = data.get("kill_switch")
+            return bool(value) if isinstance(value, bool) else None
+        except Exception:
+            logger.exception("Failed to read kill switch file %s", path)
+            return None
+
+    def _write_kill_switch_file(self, enabled: bool) -> None:
+        """Atomic write: write to temp file under flock, then os.replace."""
+        import fcntl
+
+        path = self.kill_switch_file
+        tmp_path = path.with_suffix(path.suffix + ".tmp")
+        payload = {
+            "kill_switch": bool(enabled),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        data = json.dumps(payload, ensure_ascii=False)
+        try:
+            with tmp_path.open("w", encoding="utf-8") as fh:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+                try:
+                    fh.write(data)
+                    fh.flush()
+                    os.fsync(fh.fileno())
+                finally:
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+            os.replace(tmp_path, path)
+        except Exception:
+            logger.exception("Failed to write kill switch file %s", path)
+            try:
+                if tmp_path.exists():
+                    tmp_path.unlink()
+            except Exception:
+                pass
+
+    def _validate_url(self, url: str) -> tuple[str, str]:
+        """SSRF guard: only allow http/https to public hosts.
+
+        Returns (safe_ip, host_header) so the caller can connect directly
+        to the resolved IP (closing the DNS-rebinding TOCTOU window).
+        """
         import ipaddress
         import socket
 
@@ -341,26 +398,48 @@ class BasalGanglia:
         if hostname.lower() in forbidden_hosts:
             raise ValueError(f"Forbidden hostname: {hostname}")
 
+        # If the host is already a literal IP, validate it directly.
+        try:
+            literal_ip = ipaddress.ip_address(hostname)
+            self._assert_public_ip(literal_ip, hostname)
+            host_header = hostname if parsed.port is None else f"{hostname}:{parsed.port}"
+            return str(literal_ip), host_header
+        except ValueError:
+            pass
+
         try:
             infos = socket.getaddrinfo(hostname, None)
         except socket.gaierror as exc:
             raise ValueError(f"Cannot resolve hostname {hostname}: {exc}") from exc
 
+        # Validate every returned address; pick the first IPv4 (then IPv6) as safe_ip.
+        safe_ip: str | None = None
         for info in infos:
             addr = info[4][0]
             try:
                 ip = ipaddress.ip_address(addr)
             except ValueError:
                 continue
-            if (
-                ip.is_private
-                or ip.is_loopback
-                or ip.is_link_local
-                or ip.is_multicast
-                or ip.is_reserved
-                or ip.is_unspecified
-            ):
-                raise ValueError(f"URL resolves to forbidden address {addr} (host={hostname})")
+            self._assert_public_ip(ip, hostname)
+            if safe_ip is None:
+                safe_ip = str(ip)
+
+        if safe_ip is None:
+            raise ValueError(f"No usable address for hostname {hostname}")
+
+        host_header = hostname if parsed.port is None else f"{hostname}:{parsed.port}"
+        return safe_ip, host_header
+
+    def _assert_public_ip(self, ip: Any, hostname: str) -> None:
+        if (
+            ip.is_private
+            or ip.is_loopback
+            or ip.is_link_local
+            or ip.is_multicast
+            or ip.is_reserved
+            or ip.is_unspecified
+        ):
+            raise ValueError(f"URL resolves to forbidden address {ip} (host={hostname})")
 
     def _validate_file_path(self, path: Path) -> None:
         """Restrict file.read to allowlisted roots; reject traversal & secrets."""
@@ -374,22 +453,34 @@ class BasalGanglia:
 
         resolved_str = str(resolved)
 
-        forbidden_patterns = (
-            "/etc/shadow",
-            "/etc/passwd",
-            "/etc/sudoers",
-            "/.ssh/",
-            "/.aws/",
-            "/.gnupg/",
+        # Blanket-reject any access under sensitive system roots.
+        forbidden_prefixes = (
+            "/etc/",
             "/root/",
             "/proc/",
             "/sys/",
+            "/boot/",
+            "/var/log/",
+        )
+        for prefix in forbidden_prefixes:
+            if resolved_str == prefix.rstrip("/") or resolved_str.startswith(prefix):
+                raise ValueError(f"Forbidden path prefix {prefix!r} in {resolved_str}")
+
+        forbidden_patterns = (
+            "/.ssh/",
+            "/.aws/",
+            "/.gnupg/",
+            "/.config/gcloud/",
+            "/.kube/",
+            "/.docker/",
         )
         for pattern in forbidden_patterns:
             if pattern in resolved_str:
                 raise ValueError(f"Forbidden path pattern {pattern!r} in {resolved_str}")
 
-        if ".env" in resolved.name:
+        # Env files: must match by prefix on the basename, not substring.
+        basename = resolved.name
+        if basename.startswith(".env") or basename == "env" or basename.endswith(".env"):
             raise ValueError(f"Refusing to read env file: {resolved_str}")
 
         allowed_roots = [
@@ -480,8 +571,23 @@ class BasalGanglia:
         url = str(step.get("url") or "")
         if not url:
             raise ValueError("browser.navigate requires a url")
-        self._validate_url(url)
-        request = urllib.request.Request(url, headers={"User-Agent": "Cerebellum/1.0"})
+        safe_ip, host_header = self._validate_url(url)
+
+        parsed = urllib.parse.urlparse(url)
+        # Rebuild netloc using the validated IP; preserve port if present.
+        if parsed.port is not None:
+            new_netloc = f"{safe_ip}:{parsed.port}"
+        else:
+            new_netloc = safe_ip
+        rebuilt = parsed._replace(netloc=new_netloc).geturl()
+
+        request = urllib.request.Request(
+            rebuilt,
+            headers={
+                "User-Agent": "Cerebellum/1.0",
+                "Host": host_header,
+            },
+        )
         with urllib.request.urlopen(request, timeout=20) as response:
             try:
                 http_status = getattr(response, "status", None)
@@ -493,6 +599,7 @@ class BasalGanglia:
                 "status": "ok",
                 "tool": "browser.navigate",
                 "url": url,
+                "resolved_ip": safe_ip,
                 "http_status": http_status,
                 "content_type": content_type,
             }
@@ -615,11 +722,19 @@ class BasalGanglia:
             data=json.dumps(payload).encode("utf-8"),
             headers={"Content-Type": "application/json"},
         )
+        MAX_TELEGRAM_RESPONSE_BYTES = 256 * 1024  # 256 KiB
         try:
             with urllib.request.urlopen(request, timeout=30) as response:
-                return json.loads(response.read().decode("utf-8"))
+                raw = response.read(MAX_TELEGRAM_RESPONSE_BYTES + 1)
+            if len(raw) > MAX_TELEGRAM_RESPONSE_BYTES:
+                raise RuntimeError("Telegram response exceeded 256 KiB cap")
+            return json.loads(raw.decode("utf-8"))
         except urllib.error.HTTPError as exc:
-            body = exc.read().decode("utf-8", errors="replace")
+            body_bytes = exc.read(MAX_TELEGRAM_RESPONSE_BYTES + 1)
+            if len(body_bytes) > MAX_TELEGRAM_RESPONSE_BYTES:
+                body = "<response truncated at 256 KiB>"
+            else:
+                body = body_bytes.decode("utf-8", errors="replace")
             raise RuntimeError(f"Telegram API error {exc.code}: {body}") from exc
 
     def _telegram_keyboard(self, hypothesis_id: str) -> list[list[dict[str, str]]]:
@@ -725,8 +840,24 @@ class BasalGanglia:
         return default
 
     def _save_json(self, path: Path, payload: Any) -> None:
+        """Atomically write JSON: temp file in same dir, fsync, os.replace."""
         with self._lock:
-            path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+            tmp_path = path.with_suffix(path.suffix + ".tmp")
+            data = json.dumps(payload, indent=2, ensure_ascii=False)
+            try:
+                with tmp_path.open("w", encoding="utf-8") as fh:
+                    fh.write(data)
+                    fh.flush()
+                    os.fsync(fh.fileno())
+                os.replace(tmp_path, path)
+            except Exception:
+                logger.exception("Atomic save failed for %s", path)
+                try:
+                    if tmp_path.exists():
+                        tmp_path.unlink()
+                except Exception:
+                    pass
+                raise
 
     def _append_jsonl(self, path: Path, payload: dict[str, Any]) -> None:
         with self._lock:

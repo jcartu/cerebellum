@@ -6,7 +6,9 @@ Wants=network-online.target openclaw-gateway.service
 [Service]
 Type=simple
 WorkingDirectory=/home/josh/.openclaw/cerebellum
-ExecStart=/usr/bin/python3 /home/josh/.openclaw/cerebellum/src/observatory_main.py
+User=josh
+Group=josh
+ExecStart=/home/linuxbrew/.linuxbrew/bin/python3 /home/josh/.openclaw/cerebellum/src/observatory_main.py
 Restart=on-failure
 RestartSec=10
 WatchdogSec=30

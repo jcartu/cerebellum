@@ -226,7 +226,7 @@ class PrefrontalCortex:
                             {"role": "user", "content": prompt},
                         ],
                     )
-                    usage = self._extract_usage(response)
+                    usage = self._extract_usage(response, model=model)
                     content = self._clean_json_content(self._extract_message_content(response))
                     parsed = json.loads(content)
                     hypotheses = parsed.get("hypotheses") if isinstance(parsed, dict) else parsed
@@ -249,13 +249,15 @@ class PrefrontalCortex:
                     time.sleep(delay)
         return [], {}
 
-    def _extract_usage(self, response: Any) -> dict[str, int]:
+    def _extract_usage(self, response: Any, model: str | None = None) -> dict[str, Any]:
         usage = getattr(response, "usage", None)
         prompt_tokens = int(getattr(usage, "prompt_tokens", 0) or 0)
         completion_tokens = int(getattr(usage, "completion_tokens", 0) or 0)
         total_tokens = int(getattr(usage, "total_tokens", 0) or (prompt_tokens + completion_tokens))
+        actual_model = str(getattr(response, "model", None) or model or "")
         logger.info(
-            "LLM usage: prompt=%s completion=%s total=%s",
+            "LLM usage: model=%s prompt=%s completion=%s total=%s",
+            actual_model,
             prompt_tokens,
             completion_tokens,
             total_tokens,
@@ -264,6 +266,7 @@ class PrefrontalCortex:
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
             "total_tokens": total_tokens,
+            "model": actual_model,
         }
 
     def _extract_message_content(self, response: Any) -> str:
@@ -517,7 +520,7 @@ class PrefrontalCortex:
         item: dict[str, Any],
         episodes: list,
         events: list,
-        usage: dict[str, int] | None = None,
+        usage: dict[str, Any] | None = None,
     ) -> Optional[Hypothesis]:
         try:
             title = str(item.get("title", "")).strip()
@@ -540,13 +543,18 @@ class PrefrontalCortex:
             usage = usage or {}
             prompt_tokens = int(usage.get("prompt_tokens", 0) or 0)
             completion_tokens = int(usage.get("completion_tokens", 0) or 0)
-            derived_cost = self._derive_cost(prompt_tokens, completion_tokens)
+            model_used = str(usage.get("model") or "")
+            derived_cost = self._derive_cost(prompt_tokens, completion_tokens, model=model_used)
             logger.info(
-                "Derived hypothesis cost from usage: prompt=%s completion=%s cost=%.6f",
+                "Derived hypothesis cost from usage: model=%s prompt=%s completion=%s cost=%.6f",
+                model_used,
                 prompt_tokens,
                 completion_tokens,
                 derived_cost,
             )
+            metadata.setdefault("cost_model", model_used)
+            metadata.setdefault("cost_prompt_tokens", prompt_tokens)
+            metadata.setdefault("cost_completion_tokens", completion_tokens)
             return Hypothesis(
                 id=str(uuid.uuid4()),
                 timestamp=datetime.now(timezone.utc).isoformat(),
@@ -566,9 +574,39 @@ class PrefrontalCortex:
             logger.warning("Discarding invalid hypothesis payload %s: %s", item, exc)
             return None
 
-    def _derive_cost(self, prompt_tokens: int, completion_tokens: int) -> float:
-        cost = (max(0, prompt_tokens) + max(0, completion_tokens)) * 0.000001
-        return max(0.0, min(1.0, round(cost, 6)))
+    # USD per 1M tokens. Conservative upper-bound estimates — update quarterly.
+    _MODEL_PRICING_USD_PER_MTOK: dict[str, tuple[float, float]] = {
+        # model_id: (prompt_price, completion_price)
+        "openai/gpt-4o": (2.50, 10.00),
+        "openai/gpt-4o-mini": (0.15, 0.60),
+        "anthropic/claude-opus-4.7": (15.00, 75.00),
+        "anthropic/claude-sonnet-4": (3.00, 15.00),
+        "anthropic/claude-haiku-4": (0.80, 4.00),
+        "google/gemini-2.0-flash": (0.10, 0.40),
+    }
+    _FALLBACK_PRICING = (5.00, 15.00)  # unknown model — assume pricey
+
+    def _derive_cost(
+        self,
+        prompt_tokens: int,
+        completion_tokens: int,
+        model: str | None = None,
+    ) -> float:
+        """Estimate hypothesis-generation cost in USD using per-model pricing.
+
+        Returns a value clamped to [0.0, 1.0] because downstream policy
+        thresholds (arbiter) treat cost as a unit-interval score.
+        """
+        prompt = max(0, int(prompt_tokens or 0))
+        completion = max(0, int(completion_tokens or 0))
+        chosen_model = (model or "").strip()
+        if chosen_model not in self._MODEL_PRICING_USD_PER_MTOK and self.model_candidates:
+            chosen_model = self.model_candidates[0]
+        prompt_price, completion_price = self._MODEL_PRICING_USD_PER_MTOK.get(
+            chosen_model, self._FALLBACK_PRICING
+        )
+        cost_usd = (prompt * prompt_price + completion * completion_price) / 1_000_000.0
+        return max(0.0, min(1.0, round(cost_usd, 6)))
 
     def _fallback_context_summary(self, episodes: list, events: list) -> str:
         return (
@@ -582,15 +620,40 @@ class PrefrontalCortex:
             return 0.0
 
     def _is_duplicate(self, hypothesis: Hypothesis, existing: list[dict[str, Any]]) -> bool:
-        normalized_title = hypothesis.title.strip().lower()
+        """Duplicate if exact title match OR Jaccard token similarity > 0.8.
+
+        The old substring-in-description rule falsely flagged almost any
+        hypothesis whose title happened to be a common phrase.
+        """
+        candidate_title = hypothesis.title.strip().lower()
+        if not candidate_title:
+            return False
+        candidate_tokens = self._tokenize_for_dedup(candidate_title)
+
         for item in existing:
-            title = str(item.get("title", "")).strip().lower()
-            description = str(item.get("description", "")).strip().lower()
-            if title == normalized_title:
+            existing_title = str(item.get("title", "")).strip().lower()
+            if not existing_title:
+                continue
+            if existing_title == candidate_title:
                 return True
-            if normalized_title and normalized_title in description:
+            existing_tokens = self._tokenize_for_dedup(existing_title)
+            if self._jaccard(candidate_tokens, existing_tokens) > 0.8:
                 return True
         return False
+
+    @staticmethod
+    def _tokenize_for_dedup(text: str) -> set[str]:
+        import re as _re
+
+        return {tok for tok in _re.findall(r"[a-z0-9]+", text.lower()) if len(tok) > 2}
+
+    @staticmethod
+    def _jaccard(a: set[str], b: set[str]) -> float:
+        if not a or not b:
+            return 0.0
+        intersection = len(a & b)
+        union = len(a | b)
+        return intersection / union if union else 0.0
 
     def _store_hypothesis(self, hypothesis: Hypothesis) -> bool:
         try:

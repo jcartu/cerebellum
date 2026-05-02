@@ -6,7 +6,9 @@ Wants=network-online.target cerebellum-observatory.service
 [Service]
 Type=simple
 WorkingDirectory=/home/josh/.openclaw/cerebellum
-ExecStart=/usr/bin/python3 /home/josh/.openclaw/cerebellum/scripts/arbiter_loop.py
+User=josh
+Group=josh
+ExecStart=/home/linuxbrew/.linuxbrew/bin/python3 /home/josh/.openclaw/cerebellum/scripts/arbiter_loop.py
 Restart=on-failure
 RestartSec=15
 WatchdogSec=30

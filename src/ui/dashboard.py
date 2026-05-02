@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hmac
 import html
 import json
 import logging
@@ -259,7 +260,10 @@ async def telegram_webhook(request: Request) -> JSONResponse:
         raise HTTPException(status_code=503, detail="Webhook secret not configured")
 
     provided_secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
-    if provided_secret != TELEGRAM_WEBHOOK_SECRET:
+    if not hmac.compare_digest(
+        provided_secret.encode("utf-8"),
+        TELEGRAM_WEBHOOK_SECRET.encode("utf-8"),
+    ):
         logger.warning("Rejected Telegram webhook: bad secret token")
         raise HTTPException(status_code=401, detail="Invalid webhook secret")
 
