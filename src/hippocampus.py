@@ -31,8 +31,26 @@ class Hippocampus:
     GRAPH_DIR = Path("/home/josh/.openclaw/cerebellum/graph")
     DEFAULT_OPENROUTER_MODEL = "openai/gpt-4o"
     DEFAULT_OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-    _READ_ONLY_QUERY_PREFIXES = ("MATCH", "WITH", "RETURN", "CALL", "UNWIND")
-    _READ_ONLY_BLOCKLIST = re.compile(r"\b(CREATE|MERGE|DELETE|DETACH|SET|DROP|COPY|LOAD|REMOVE)\b", re.IGNORECASE)
+    _READ_ONLY_QUERY_PREFIXES = ("MATCH", "CALL", "UNWIND", "WITH", "RETURN", "EXPLAIN", "PROFILE")
+    _READ_ONLY_BLOCKED_KEYWORDS = (
+        "CREATE",
+        "MERGE",
+        "DELETE",
+        "DETACH",
+        "SET",
+        "DROP",
+        "COPY",
+        "LOAD",
+        "REMOVE",
+        "INSTALL",
+        "ALTER",
+        "ATTACH",
+        "USE",
+        "IMPORT",
+        "EXPORT",
+        "UPDATE",
+        "UPSERT",
+    )
 
     def __init__(self, config_path: str):
         self.config_path = Path(config_path).expanduser()
@@ -635,8 +653,9 @@ Schema:
 
 Rules:
 - Return strict JSON with a single key named query.
-- Query must be read-only and start with MATCH, WITH, RETURN, CALL, or UNWIND.
-- Never use CREATE, MERGE, DELETE, SET, COPY, LOAD, DROP, or REMOVE.
+- Query must be read-only and start with MATCH, CALL, UNWIND, WITH, RETURN, EXPLAIN, or PROFILE.
+- Never include comments or semicolons.
+- Never use CREATE, MERGE, DELETE, DETACH, SET, DROP, COPY, LOAD, REMOVE, INSTALL, ALTER, ATTACH, USE, IMPORT, EXPORT, UPDATE, or UPSERT.
 - Prefer LIMIT 25 unless the user requests more.
 
 User request: {natural_language}
@@ -645,7 +664,7 @@ User request: {natural_language}
         try:
             response = self._call_llm(prompt)
             parsed = self._extract_json_object(response.text)
-            query = str(parsed.get("query", "")).strip()
+            query = self._strip_query_comments(str(parsed.get("query", ""))).strip()
             return query or None
         except Exception as exc:
             logger.warning("Failed to generate NL query via LLM: %s", exc)
@@ -709,13 +728,26 @@ User request: {natural_language}
             return json.loads(match.group(0))
 
     def _is_safe_read_query(self, query: str) -> bool:
-        candidate = query.strip()
+        if not query or not query.strip():
+            return False
+
+        candidate = self._strip_query_comments(query).strip()
         if not candidate:
             return False
-        if self._READ_ONLY_BLOCKLIST.search(candidate):
+
+        if ";" in candidate:
             return False
-        upper = candidate.upper()
-        return upper.startswith(self._READ_ONLY_QUERY_PREFIXES)
+
+        for keyword in self._READ_ONLY_BLOCKED_KEYWORDS:
+            if re.search(r"\b" + keyword + r"\b", candidate, re.IGNORECASE):
+                return False
+
+        first_word = candidate.split()[0].upper() if candidate.split() else ""
+        return first_word in self._READ_ONLY_QUERY_PREFIXES
+
+    def _strip_query_comments(self, query: str) -> str:
+        without_block_comments = re.sub(r"/\*.*?\*/", "", query, flags=re.DOTALL)
+        return re.sub(r"--.*$", "", without_block_comments, flags=re.MULTILINE)
 
     def _hash_payload(self, payload: dict[str, Any], timestamp: str) -> str:
         digest = hashlib.sha1(f"{timestamp}|{json.dumps(payload, sort_keys=True, default=str)}".encode("utf-8")).hexdigest()

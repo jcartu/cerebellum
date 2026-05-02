@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import re
 import subprocess
 import threading
 import time
@@ -8,6 +9,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from http.client import HTTPSConnection
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -98,6 +100,52 @@ class DailyCostTracker:
                 "spent": round(self._spent, 4),
                 "remaining": round(max(self.max_cost - self._spent, 0.0), 4),
             }
+
+
+class _NoRedirectHandler(urllib.request.HTTPErrorProcessor):
+    def http_response(self, request: urllib.request.Request, response: Any) -> Any:
+        if response.status in (301, 302, 303, 307, 308):
+            raise urllib.error.HTTPError(
+                response.url,
+                response.status,
+                "Redirect forbidden",
+                response.headers,
+                None,
+            )
+        return response
+
+    https_response = http_response
+
+
+class _PinnedHTTPSConnection(HTTPSConnection):
+    def __init__(self, *args: Any, connect_host: str, server_hostname: str | None = None, **kwargs: Any):
+        self._connect_host = connect_host
+        self._server_hostname = server_hostname
+        super().__init__(*args, **kwargs)
+
+    def connect(self) -> None:
+        self.sock = self._create_connection((self._connect_host, self.port), self.timeout, self.source_address)
+        if self._tunnel_host:
+            self._tunnel()
+        self.sock = self._context.wrap_socket(self.sock, server_hostname=self._server_hostname or self.host)
+
+
+class _PinnedHTTPSHandler(urllib.request.HTTPSHandler):
+    def __init__(self, connect_host: str, server_hostname: str):
+        super().__init__()
+        self._connect_host = connect_host
+        self._server_hostname = server_hostname
+
+    def https_open(self, req: urllib.request.Request) -> Any:
+        return self.do_open(
+            lambda host, **kwargs: _PinnedHTTPSConnection(
+                host,
+                connect_host=self._connect_host,
+                server_hostname=self._server_hostname,
+                **kwargs,
+            ),
+            req,
+        )
 
 
 class BasalGanglia:
@@ -193,6 +241,16 @@ class BasalGanglia:
 
     def auto_execute(self, hypothesis: dict) -> dict:
         hypothesis_id = str(hypothesis.get("id") or hypothesis.get("hypothesis_id") or uuid.uuid4())
+        self._refresh_kill_switch_from_disk()
+        if self.kill_switch:
+            logging.warning("auto_execute blocked by kill switch: %s", hypothesis_id)
+            return {
+                "hypothesis_id": hypothesis_id,
+                "status": "blocked",
+                "executed_at": datetime.now(timezone.utc).isoformat(),
+                "results": [],
+                "reason": "kill switch enabled",
+            }
         results: list[dict[str, Any]] = []
         success = True
         for step in self._extract_plan(hypothesis):
@@ -240,18 +298,34 @@ class BasalGanglia:
             "hypothesis": hypothesis,
             "telegram_result": telegram_result,
         }
+        import fcntl
+
+        lock_path = self.pending_file.with_suffix(".json.lock")
         with self._lock:
-            pending = self._load_json(self.pending_file, default={})
-            pending[hypothesis_id] = record
-            self._save_json(self.pending_file, pending)
+            with lock_path.open("w", encoding="utf-8") as lock_f:
+                fcntl.flock(lock_f.fileno(), fcntl.LOCK_EX)
+                try:
+                    pending = self._load_json(self.pending_file, default={})
+                    pending[hypothesis_id] = record
+                    self._save_json(self.pending_file, pending)
+                finally:
+                    fcntl.flock(lock_f.fileno(), fcntl.LOCK_UN)
         self._update_hypothesis_state(hypothesis_id, "pending_approval", record)
         self._emit_event("cerebellum.approval.staged", record)
         return message_id
 
     def handle_approval(self, hypothesis_id: str, decision: str, user_id: str = "") -> dict:
+        import fcntl
+
+        lock_path = self.pending_file.with_suffix(".json.lock")
         with self._lock:
-            pending = self._load_json(self.pending_file, default={})
-        record = pending.get(hypothesis_id, {})
+            with lock_path.open("w", encoding="utf-8") as lock_f:
+                fcntl.flock(lock_f.fileno(), fcntl.LOCK_EX)
+                try:
+                    pending = self._load_json(self.pending_file, default={})
+                    record = pending.get(hypothesis_id, {})
+                finally:
+                    fcntl.flock(lock_f.fileno(), fcntl.LOCK_UN)
         response = {
             "hypothesis_id": hypothesis_id,
             "decision": decision,
@@ -260,6 +334,12 @@ class BasalGanglia:
         }
         try:
             if decision == "approve":
+                self._refresh_kill_switch_from_disk()
+                if self.kill_switch:
+                    logging.warning("handle_approval blocked by kill switch: %s", hypothesis_id)
+                    response["status"] = "blocked"
+                    response["error"] = "kill switch enabled"
+                    return response
                 hypothesis = record.get("hypothesis", {})
                 response["execution"] = self.auto_execute(hypothesis)
                 response["status"] = "approved"
@@ -271,9 +351,14 @@ class BasalGanglia:
                 response["status"] = "snoozed"
                 record["expires_at"] = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
                 with self._lock:
-                    pending = self._load_json(self.pending_file, default={})
-                    pending[hypothesis_id] = record
-                    self._save_json(self.pending_file, pending)
+                    with lock_path.open("w", encoding="utf-8") as lock_f:
+                        fcntl.flock(lock_f.fileno(), fcntl.LOCK_EX)
+                        try:
+                            pending = self._load_json(self.pending_file, default={})
+                            pending[hypothesis_id] = record
+                            self._save_json(self.pending_file, pending)
+                        finally:
+                            fcntl.flock(lock_f.fileno(), fcntl.LOCK_UN)
                 self._update_hypothesis_state(hypothesis_id, "snoozed", response)
             elif decision == "explain":
                 response["status"] = "explained"
@@ -285,9 +370,14 @@ class BasalGanglia:
 
             if decision in {"approve", "reject"}:
                 with self._lock:
-                    pending = self._load_json(self.pending_file, default={})
-                    pending.pop(hypothesis_id, None)
-                    self._save_json(self.pending_file, pending)
+                    with lock_path.open("w", encoding="utf-8") as lock_f:
+                        fcntl.flock(lock_f.fileno(), fcntl.LOCK_EX)
+                        try:
+                            pending = self._load_json(self.pending_file, default={})
+                            pending.pop(hypothesis_id, None)
+                            self._save_json(self.pending_file, pending)
+                        finally:
+                            fcntl.flock(lock_f.fileno(), fcntl.LOCK_UN)
 
             self._emit_event("cerebellum.approval", response)
             return response
@@ -588,7 +678,14 @@ class BasalGanglia:
                 "Host": host_header,
             },
         )
-        with urllib.request.urlopen(request, timeout=20) as response:
+        if parsed.scheme == "https":
+            opener = urllib.request.build_opener(
+                _NoRedirectHandler(),
+                _PinnedHTTPSHandler(connect_host=safe_ip, server_hostname=parsed.hostname or ""),
+            )
+        else:
+            opener = urllib.request.build_opener(_NoRedirectHandler())
+        with opener.open(request, timeout=20) as response:
             try:
                 http_status = getattr(response, "status", None)
                 content_type = response.headers.get("Content-Type")
@@ -642,14 +739,19 @@ class BasalGanglia:
         }
 
     def _handle_memory_query(self, step: dict[str, Any]) -> dict[str, Any]:
-        endpoint = os.environ.get("QDRANT_URL", "http://127.0.0.1:6333")
+        qdrant_url = os.environ.get("QDRANT_URL", "http://127.0.0.1:6333")
+        parsed = urllib.parse.urlparse(qdrant_url)
+        if parsed.hostname not in ("127.0.0.1", "localhost", "::1"):
+            raise ValueError(f"Qdrant URL must be localhost, got {parsed.hostname}")
         collection = str(step.get("collection") or os.environ.get("QDRANT_COLLECTION", "memory"))
+        if not re.fullmatch(r"^[A-Za-z0-9_\-]{1,64}$", collection):
+            raise ValueError(f"Invalid Qdrant collection name: {collection}")
         vector = step.get("vector")
         if vector is None:
             raise ValueError("memory.query requires a vector payload")
         payload = json.dumps({"vector": vector, "limit": int(step.get("limit", 5))}).encode("utf-8")
         request = urllib.request.Request(
-            f"{endpoint.rstrip('/')}/collections/{collection}/points/search",
+            f"{qdrant_url.rstrip('/')}/collections/{urllib.parse.quote(collection, safe='')}/points/search",
             data=payload,
             headers={"Content-Type": "application/json"},
         )
@@ -665,6 +767,9 @@ class BasalGanglia:
         api_key = os.environ.get("OPENROUTER_API_KEY")
         if not api_key:
             raise RuntimeError("OPENROUTER_API_KEY is not configured")
+        model_candidates = self.policy.get("model_candidates", ["openai/gpt-4o"])
+        if step.get("model") not in model_candidates:
+            raise ValueError(f"Model {step.get('model')} not in allowlist {model_candidates}")
         payload = {
             "model": step.get("model") or "openai/gpt-4o",
             "messages": step.get("messages")

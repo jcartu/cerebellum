@@ -7,6 +7,9 @@ import json
 import logging
 import os
 import re
+import sqlite3
+import threading
+import time
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -66,6 +69,49 @@ def get_arbiter() -> BasalGanglia | None:
 
 
 app = FastAPI(title="Cerebellum Observatory")
+DASHBOARD_TOKEN = os.environ.get("DASHBOARD_TOKEN", "")
+_dashboard_db: sqlite3.Connection | None = None
+_dashboard_db_lock = threading.RLock()
+
+
+def _dashboard_db_path() -> Path:
+    config = json.loads(CONFIG_PATH.read_text())
+    return Path(config["sqlite"]["events_db"]).expanduser()
+
+
+def _get_dashboard_db() -> sqlite3.Connection:
+    global _dashboard_db
+    with _dashboard_db_lock:
+        if _dashboard_db is None:
+            db_path = _dashboard_db_path()
+            db_path.parent.mkdir(parents=True, exist_ok=True)
+            _dashboard_db = sqlite3.connect(db_path, check_same_thread=False)
+            _dashboard_db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS telegram_seen_updates (
+                    update_id INTEGER PRIMARY KEY,
+                    seen_at INTEGER NOT NULL
+                )
+                """
+            )
+            _dashboard_db.commit()
+        return _dashboard_db
+
+
+@app.on_event("startup")
+async def _startup_init_dashboard_db() -> None:
+    _get_dashboard_db()
+
+
+@app.middleware("http")
+async def auth_middleware(request: Request, call_next: Any) -> Any:
+    if request.url.path in ("/healthz", "/telegram/webhook"):
+        return await call_next(request)
+    if DASHBOARD_TOKEN:
+        auth = request.headers.get("Authorization", "")
+        if not hmac.compare_digest(auth, f"Bearer {DASHBOARD_TOKEN}"):
+            return JSONResponse(status_code=401, content={"error": "unauthorized"})
+    return await call_next(request)
 
 
 # ---------------------------------------------------------------------------
@@ -276,8 +322,48 @@ async def telegram_webhook(request: Request) -> JSONResponse:
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid JSON body")
 
+    now_ts = int(time.time())
+    update_id_raw = update.get("update_id", update.get("id"))
+    try:
+        update_id = int(update_id_raw) if update_id_raw is not None else None
+    except (TypeError, ValueError):
+        update_id = None
+
+    if update_id is not None:
+        with _dashboard_db_lock:
+            db = _get_dashboard_db()
+            cursor = db.cursor()
+            cursor.execute(
+                "SELECT seen_at FROM telegram_seen_updates WHERE update_id = ?",
+                (update_id,),
+            )
+            row = cursor.fetchone()
+            if row:
+                return JSONResponse({"ok": True, "message": "update already processed"})
+            cursor.execute(
+                "INSERT OR IGNORE INTO telegram_seen_updates (update_id, seen_at) VALUES (?, ?)",
+                (update_id, now_ts),
+            )
+            if cursor.rowcount == 0:
+                db.commit()
+                return JSONResponse({"ok": True, "message": "update already processed"})
+            db.commit()
+            cursor.execute(
+                "DELETE FROM telegram_seen_updates WHERE seen_at < ?",
+                (now_ts - 86400,),
+            )
+            db.commit()
+
     callback = update.get("callback_query") or {}
     message = update.get("message") or {}
+
+    msg_date_raw = callback.get("message", {}).get("date", 0)
+    try:
+        msg_date = int(msg_date_raw)
+    except (TypeError, ValueError):
+        msg_date = 0
+    if msg_date and (time.time() - msg_date) > 300:
+        return JSONResponse({"ok": True, "message": "callback expired"})
 
     def _actor_id(obj: dict) -> str:
         user = obj.get("from") or {}
