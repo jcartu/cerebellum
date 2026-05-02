@@ -4,12 +4,13 @@ import os
 import sqlite3
 import subprocess
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
 
@@ -40,17 +41,14 @@ class RateLimiter:
     def __init__(self, max_count: int, window_seconds: int):
         self.max_count = max_count
         self.window_seconds = window_seconds
-        self.events: list[datetime] = []
+        self.events: list[float] = []
         self._lock = threading.Lock()
 
     def allow(self) -> bool:
         with self._lock:
-            now = datetime.now()
-            self.events = [
-                event
-                for event in self.events
-                if now - event < timedelta(seconds=self.window_seconds)
-            ]
+            now = time.monotonic()
+            cutoff = now - self.window_seconds
+            self.events = [event for event in self.events if event > cutoff]
             if len(self.events) >= self.max_count:
                 return False
             self.events.append(now)
@@ -58,12 +56,9 @@ class RateLimiter:
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
-            now = datetime.now()
-            self.events = [
-                event
-                for event in self.events
-                if now - event < timedelta(seconds=self.window_seconds)
-            ]
+            now = time.monotonic()
+            cutoff = now - self.window_seconds
+            self.events = [event for event in self.events if event > cutoff]
             return {
                 "max_count": self.max_count,
                 "window_seconds": self.window_seconds,
@@ -78,12 +73,12 @@ class DailyCostTracker:
     def __init__(self, max_cost: float):
         self.max_cost = max_cost
         self._lock = threading.Lock()
-        self._day = datetime.now().date()
+        self._day = datetime.now(timezone.utc).date()
         self._spent = 0.0
 
     def allow(self, additional_cost: float) -> bool:
         with self._lock:
-            today = datetime.now().date()
+            today = datetime.now(timezone.utc).date()
             if today != self._day:
                 self._day = today
                 self._spent = 0.0
@@ -94,7 +89,7 @@ class DailyCostTracker:
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
-            today = datetime.now().date()
+            today = datetime.now(timezone.utc).date()
             if today != self._day:
                 self._day = today
                 self._spent = 0.0
@@ -377,14 +372,21 @@ class BasalGanglia:
         url = str(step.get("url") or "")
         if not url:
             raise ValueError("browser.navigate requires a url")
+        self._validate_url(url)
         request = urllib.request.Request(url, headers={"User-Agent": "Cerebellum/1.0"})
         with urllib.request.urlopen(request, timeout=20) as response:
+            try:
+                http_status = getattr(response, "status", None)
+                content_type = response.headers.get("Content-Type")
+            except TypeError:
+                http_status = None
+                content_type = None
             return {
                 "status": "ok",
                 "tool": "browser.navigate",
                 "url": url,
-                "http_status": getattr(response, "status", None),
-                "content_type": response.headers.get("Content-Type"),
+                "http_status": http_status,
+                "content_type": content_type,
             }
 
     def _handle_web_search(self, step: dict[str, Any]) -> dict[str, Any]:
@@ -410,6 +412,7 @@ class BasalGanglia:
         path = Path(str(step.get("path") or step.get("file") or ""))
         if not str(path):
             raise ValueError("file.read requires a path")
+        self._validate_file_path(path)
         content = path.read_text(encoding="utf-8")
         return {
             "status": "ok",
@@ -440,7 +443,7 @@ class BasalGanglia:
         if not api_key:
             raise RuntimeError("OPENROUTER_API_KEY is not configured")
         payload = {
-            "model": step.get("model") or "openrouter/openai/gpt-5.5",
+            "model": step.get("model") or "openai/gpt-4o",
             "messages": step.get("messages")
             or [{"role": "user", "content": str(step.get("prompt") or "")}],
         }
@@ -530,7 +533,10 @@ class BasalGanglia:
     def _update_hypothesis_state(self, hypothesis_id: str, state: str, payload: dict[str, Any]) -> None:
         if self.cortex is not None:
             for method_name in ("update_hypothesis_state", "set_hypothesis_state"):
-                method = getattr(self.cortex, method_name, None)
+                try:
+                    method = getattr(self.cortex, method_name, None)
+                except TypeError:
+                    continue
                 if callable(method):
                     try:
                         method(hypothesis_id, state, payload)
@@ -552,7 +558,10 @@ class BasalGanglia:
     def _emit_event(self, topic: str, payload: dict[str, Any]) -> None:
         if self.emitter is not None:
             for method_name in ("emit", "publish", "send"):
-                method = getattr(self.emitter, method_name, None)
+                try:
+                    method = getattr(self.emitter, method_name, None)
+                except TypeError:
+                    continue
                 if callable(method):
                     try:
                         method(topic, payload)

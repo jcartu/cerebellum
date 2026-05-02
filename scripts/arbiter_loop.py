@@ -144,11 +144,11 @@ def main() -> int:
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)
 
-cortex = _load_cortex()
-emitter = _load_emitter()
+    cortex = _load_cortex()
+    emitter = _load_emitter()
     hippocampus = _load_hippocampus()
     _wire_cortex(cortex, emitter, hippocampus)
-arbiter = BasalGanglia(str(BASE_DIR / "policy.yaml"), cortex=cortex, emitter=emitter)
+    arbiter = BasalGanglia(str(BASE_DIR / "policy.yaml"), cortex=cortex, emitter=emitter)
 
     LOGGER.info("Cerebellum arbiter loop started")
     while not STOP_REQUESTED:

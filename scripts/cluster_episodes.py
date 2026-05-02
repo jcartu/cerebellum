@@ -8,12 +8,13 @@ from pathlib import Path
 from typing import Any
 
 
-BASE_DIR = Path("/home/josh/.openclaw")
-if str(BASE_DIR) not in sys.path:
-    sys.path.insert(0, str(BASE_DIR))
+BASE_DIR = Path(__file__).resolve().parent.parent
+SRC_DIR = BASE_DIR / "src"
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
 
-from cerebellum.src.events import CerebellumEventEmitter  # noqa: E402
-from cerebellum.src.hippocampus import Hippocampus  # noqa: E402
+from events import CerebellumEventEmitter  # noqa: E402
+from hippocampus import Hippocampus  # noqa: E402
 
 
 logger = logging.getLogger("cerebellum.cluster_episodes")
@@ -41,7 +42,7 @@ def cluster_by_time(events: list[dict[str, Any]], threshold_minutes: int = 5) ->
 
 def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s - %(message)s")
-    config_path = "/home/josh/.openclaw/cerebellum/config.json"
+    config_path = str(BASE_DIR / "config.json")
     emitter: CerebellumEventEmitter | None = None
 
     try:

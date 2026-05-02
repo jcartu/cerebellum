@@ -63,13 +63,11 @@ class CerebellumEventEmitter:
 
         if self._nats_ready:
             try:
-                future = asyncio.run_coroutine_threadsafe(self._publish_event(event), self._loop)
-                future.result(timeout=5)
-            except Exception as exc:
-                logger.error("Failed to publish event %s to NATS: %s", event_id, exc)
+                asyncio.run_coroutine_threadsafe(self._publish_event(event), self._loop)
+            except RuntimeError:
+                logger.debug("NATS loop unavailable, stored event %s in SQLite only", event_id)
         else:
             logger.debug("NATS unavailable, stored event %s in SQLite only", event_id)
-
         return event_id
 
     def query(

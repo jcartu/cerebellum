@@ -1,32 +1,79 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import json
+import logging
+import os
+import re
 from collections import Counter
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 import uvicorn
 
 try:
     from ..events import CerebellumEventEmitter
-except ImportError:  # pragma: no cover
+except ImportError:
     import sys
 
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-    from src.events import CerebellumEventEmitter
+    from src.events import CerebellumEventEmitter  # type: ignore[no-redef]
 
+try:
+    from ..arbiter import BasalGanglia  # type: ignore[import-not-found]
+except ImportError:
+    import sys as _sys
 
+    _sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from src.arbiter import BasalGanglia  # type: ignore[no-redef]
+
+logger = logging.getLogger("cerebellum.dashboard")
 CONFIG_PATH = Path("/home/josh/.openclaw/cerebellum/config.json")
-emitter = CerebellumEventEmitter(CONFIG_PATH)
+
+# Lazy singleton — avoids module-level side effects
+_emitter: CerebellumEventEmitter | None = None
+_arbiter: BasalGanglia | None = None
+
+
+def get_emitter() -> CerebellumEventEmitter:
+    global _emitter
+    if _emitter is None:
+        try:
+            _emitter = CerebellumEventEmitter(CONFIG_PATH)
+        except Exception:
+            logger.exception("Failed to initialize emitter")
+            raise RuntimeError("Dashboard cannot start: emitter unavailable")
+    return _emitter
+
+
+def get_arbiter() -> BasalGanglia | None:
+    global _arbiter
+    if _arbiter is None:
+        policy_path = CONFIG_PATH.parent / "policy.yaml"
+        if not policy_path.exists():
+            return None
+        try:
+            _arbiter = BasalGanglia(str(policy_path), emitter=get_emitter())
+        except Exception:
+            logger.exception("Failed to initialize arbiter")
+            return None
+    return _arbiter
+
+
 app = FastAPI(title="Cerebellum Observatory")
 
 
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
 def _stats_payload() -> dict[str, Any]:
-    since = datetime.now().astimezone() - timedelta(hours=24)
+    emitter = get_emitter()
+    since = datetime.now(timezone.utc) - timedelta(hours=24)
     events = emitter.query(since=since, limit=10000)
     counts = dict(Counter(event["type"] for event in events))
     return {"window": "24h", "counts": counts, "total": len(events)}
@@ -35,23 +82,26 @@ def _stats_payload() -> dict[str, Any]:
 def _parse_since(raw_since: str | None) -> datetime | None:
     if not raw_since:
         return None
-    return datetime.fromisoformat(raw_since)
+    try:
+        return datetime.fromisoformat(raw_since).astimezone(timezone.utc)
+    except ValueError:
+        return None
 
 
 def _render_events(events: list[dict[str, Any]]) -> str:
     cards: list[str] = []
     for event in events:
-        payload = json.dumps(event["payload"], indent=2)
-        context = json.dumps(event["context"], indent=2)
+        payload = html.escape(json.dumps(event["payload"], indent=2, default=str))
+        context = html.escape(json.dumps(event["context"], indent=2, default=str))
         cards.append(
             f"""
             <article class=\"event-card\">
               <div class=\"event-meta\">
-                <span class=\"event-type\">{event['type']}</span>
-                <span>{event['timestamp']}</span>
-                <span>{event['actor']}</span>
+                <span class=\"event-type\">{html.escape(str(event['type']))}</span>
+                <span>{html.escape(str(event['timestamp']))}</span>
+                <span>{html.escape(str(event['actor']))}</span>
               </div>
-              <div class=\"event-id\">{event['id']}</div>
+              <div class=\"event-id\">{html.escape(str(event['id']))}</div>
               <details>
                 <summary>payload</summary>
                 <pre>{payload}</pre>
@@ -66,9 +116,13 @@ def _render_events(events: list[dict[str, Any]]) -> str:
     return "".join(cards) or "<div class=\"empty-state\">No events yet.</div>"
 
 
+# ---------------------------------------------------------------------------
+# Pages
+# ---------------------------------------------------------------------------
+
 @app.get("/", response_class=HTMLResponse)
 async def index() -> str:
-    events = emitter.query(limit=50)
+    events = get_emitter().query(limit=50)
     return f"""
     <!DOCTYPE html>
     <html lang=\"en\">
@@ -98,50 +152,57 @@ async def index() -> str:
       <body>
         <main>
           <h1>CEREBELLUM Observatory</h1>
-          <div class=\"subtle\">Phase 1 event stream spine · live timeline · SQLite WAL + NATS JetStream</div>
+          <div class=\"subtle\">Event stream · live timeline · SQLite WAL + NATS JetStream</div>
           <section class=\"layout\">
-            <aside class=\"panel\" id=\"stats\" hx-get=\"/api/stats/html\" hx-trigger=\"load, every 3s\" hx-swap=\"innerHTML\"></aside>
+            <aside class=\"panel\" id=\"stats\" hx-get=\"/api/stats/html\" hx-trigger=\"load, every 5s\" hx-swap=\"innerHTML\"></aside>
             <section class=\"panel\">
-              <div id=\"events\" hx-get=\"/timeline\" hx-trigger=\"load, every 3s\" hx-swap=\"innerHTML\">{_render_events(events)}</div>
+              <div id=\"events\" hx-get=\"/timeline\" hx-trigger=\"load, every 5s\" hx-swap=\"innerHTML\">{_render_events(events)}</div>
             </section>
           </section>
         </main>
-        <script>
-          const feed = document.getElementById("events");
-          const source = new EventSource("/api/events/stream");
-          source.onmessage = () => htmx.ajax("GET", "/timeline", {{target: "#events", swap: "innerHTML"}});
-        </script>
       </body>
     </html>
     """
 
 
 @app.get("/timeline", response_class=HTMLResponse)
-async def timeline(limit: int = 50) -> str:
-    return _render_events(emitter.query(limit=limit))
+async def timeline(limit: int = Query(default=50, ge=1, le=500)) -> str:
+    return _render_events(get_emitter().query(limit=limit))
+
+
+# ---------------------------------------------------------------------------
+# API
+# ---------------------------------------------------------------------------
+
+@app.get("/healthz")
+async def healthz() -> JSONResponse:
+    return JSONResponse({"status": "ok", "uptime": "running"})
 
 
 @app.get("/api/events")
-async def api_events(since: str | None = None, limit: int = 50) -> JSONResponse:
-    events = emitter.query(since=_parse_since(since), limit=limit)
+async def api_events(since: str | None = None, limit: int = Query(default=50, ge=1, le=500)) -> JSONResponse:
+    events = get_emitter().query(since=_parse_since(since), limit=limit)
     return JSONResponse(events)
 
 
 @app.get("/api/events/stream")
 async def api_events_stream(request: Request) -> StreamingResponse:
+    emitter = get_emitter()
+
     async def event_generator() -> Any:
-        last_seen = datetime.now().astimezone() - timedelta(seconds=5)
+        last_seen = datetime.now(timezone.utc) - timedelta(seconds=5)
         while True:
             if await request.is_disconnected():
                 break
-
-            for event in reversed(emitter.query(since=last_seen, limit=100)):
-                event_time = datetime.fromisoformat(event["timestamp"])
-                if event_time > last_seen:
-                    last_seen = event_time
-                yield f"data: {json.dumps(event)}\n\n"
-
-            await asyncio.sleep(1)
+            try:
+                for event in reversed(emitter.query(since=last_seen, limit=100)):
+                    event_time = datetime.fromisoformat(event["timestamp"]).astimezone(timezone.utc)
+                    if event_time > last_seen:
+                        last_seen = event_time
+                    yield f"data: {json.dumps(event, default=str)}\n\n"
+            except Exception:
+                logger.exception("SSE generator failed")
+            await asyncio.sleep(2)
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
@@ -155,7 +216,7 @@ async def api_stats() -> JSONResponse:
 async def api_stats_html() -> str:
     payload = _stats_payload()
     count_rows = "".join(
-        f"<li><strong>{event_type}</strong><span>{count}</span></li>"
+        f"<li><strong>{html.escape(event_type)}</strong><span>{count}</span></li>"
         for event_type, count in sorted(payload["counts"].items())
     ) or "<li><strong>No events</strong><span>0</span></li>"
     return f"""
@@ -165,6 +226,95 @@ async def api_stats_html() -> str:
     <style>li{{display:flex;justify-content:space-between;gap:12px;border-bottom:1px solid #16263f;padding-bottom:8px}}li:last-child{{border-bottom:none}}</style>
     """
 
+
+# ---------------------------------------------------------------------------
+# Telegram Webhook (C6 fix)
+# ---------------------------------------------------------------------------
+
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN") or os.environ.get("OPENCLAW_TELEGRAM_BOT_TOKEN", "")
+
+
+@app.post("/telegram/webhook")
+async def telegram_webhook(request: Request) -> JSONResponse:
+    """Receive Telegram callback queries and commands."""
+    if not TELEGRAM_BOT_TOKEN:
+        return JSONResponse({"ok": False, "error": "Telegram bot token not configured"}, status_code=503)
+
+    update = await request.json()
+    callback = update.get("callback_query", {})
+    message = update.get("message", {})
+
+    # Handle callback queries (approve/reject/snooze/explain buttons)
+    if callback:
+        callback_data = callback.get("data", "")
+        callback_id = callback.get("id", "")
+
+        # Parse callback data: "action:hypothesis_id"
+        match = re.match(r"^(approve|reject|snooze|explain):(.+)$", callback_data)
+        if match:
+            action, hypothesis_id = match.groups()
+            arbiter = get_arbiter()
+            if arbiter:
+                try:
+                    result = arbiter.handle_approval(hypothesis_id, action)
+                    # Answer callback query
+                    _answer_callback(callback_id, "Processed")
+                    return JSONResponse(result)
+                except Exception:
+                    logger.exception("Failed to handle approval for %s", hypothesis_id)
+                    _answer_callback(callback_id, "Error processing request")
+            else:
+                _answer_callback(callback_id, "Arbiter unavailable")
+        else:
+            _answer_callback(callback_id, "Unknown action")
+
+    # Handle /cerebellum-halt command
+    if message and message.get("text") == "/cerebellum-halt":
+        arbiter = get_arbiter()
+        if arbiter:
+            result = arbiter.toggle_kill_switch(enabled=True)
+            chat_id = message.get("chat", {}).get("id")
+            if chat_id:
+                _send_telegram_text(chat_id, f"🛑 Kill switch ENABLED: {result}")
+            return JSONResponse(result)
+        return JSONResponse({"ok": False, "error": "Arbiter unavailable"}, status_code=503)
+
+    return JSONResponse({"ok": True})
+
+
+def _answer_callback(callback_id: str, text: str) -> None:
+    try:
+        import urllib.request
+        req = urllib.request.Request(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery",
+            data=json.dumps({"callback_query_id": callback_id, "text": text}).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=10):
+            pass
+    except Exception:
+        logger.exception("Failed to answer callback %s", callback_id)
+
+
+def _send_telegram_text(chat_id: str | int, text: str) -> None:
+    try:
+        import urllib.request
+        req = urllib.request.Request(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            data=json.dumps({"chat_id": chat_id, "text": text}).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=10):
+            pass
+    except Exception:
+        logger.exception("Failed to send Telegram message to %s", chat_id)
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
 def main() -> None:
     config = json.loads(CONFIG_PATH.read_text())

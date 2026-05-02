@@ -1,47 +1,28 @@
+#!/usr/bin/env python3
+"""Cerebellum Observatory — single event store, NATS subscriber, no dashboard subprocess."""
 import asyncio
 import importlib.util
-import json
 import logging
 import signal
-import sqlite3
 import sys
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 LOGGER = logging.getLogger("cerebellum.observatory")
 BASE_DIR = Path(__file__).resolve().parent.parent
-DB_PATH = BASE_DIR / "graph" / "observatory.sqlite3"
 
 
 class ObservatoryService:
     def __init__(self) -> None:
         self.stop_requested = False
         self._emitter: Any = None
-        self._dashboard_task: asyncio.Task[Any] | None = None
         self._nats_client: Any = None
 
     async def run(self) -> None:
-        self._ensure_db()
         self._install_signal_handlers()
         await self._start_emitter()
-        await self._start_dashboard()
         await self._run_nats_loop()
-
-    def _ensure_db(self) -> None:
-        DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-        with sqlite3.connect(DB_PATH) as connection:
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS events (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    topic TEXT NOT NULL,
-                    payload TEXT NOT NULL,
-                    created_at TEXT NOT NULL
-                )
-                """
-            )
-            connection.commit()
 
     def _install_signal_handlers(self) -> None:
         loop = asyncio.get_running_loop()
@@ -72,33 +53,10 @@ class ObservatoryService:
             return
         try:
             self._emitter = emitter_cls(str(BASE_DIR / "config.json"))
-            start_method = getattr(self._emitter, "start", None)
-            if callable(start_method):
-                result = start_method()
-                if asyncio.iscoroutine(result):
-                    await result
-            LOGGER.info("Event emitter started")
+            LOGGER.info("Event emitter started (single event store: events.db)")
         except Exception:
             LOGGER.exception("Failed to start event emitter")
             self._emitter = None
-
-    async def _start_dashboard(self) -> None:
-        dashboard_module = BASE_DIR / "src" / "ui" / "dashboard.py"
-        if not dashboard_module.exists():
-            LOGGER.warning("Dashboard module missing; continuing without dashboard")
-            return
-        try:
-            import subprocess
-
-            self._dashboard_proc = subprocess.Popen(
-                [sys.executable, str(dashboard_module)],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-            )
-            LOGGER.info("Dashboard started as subprocess (pid=%d)", self._dashboard_proc.pid)
-        except Exception:
-            LOGGER.exception("Dashboard startup failed")
-            self._dashboard_proc = None
 
     async def _run_nats_loop(self) -> None:
         if importlib.util.find_spec("nats") is None:
@@ -114,15 +72,14 @@ class ObservatoryService:
             self._nats_client = await nats.connect("nats://127.0.0.1:4222")
 
             async def handler(message: Any) -> None:
-                payload = {
-                    "subject": message.subject,
-                    "reply": message.reply,
-                    "data": message.data.decode("utf-8", errors="replace"),
-                }
-                self._write_event(message.subject, payload)
+                try:
+                    data = message.data.decode("utf-8", errors="replace")
+                    self._relay_event(message.subject, data)
+                except Exception:
+                    LOGGER.exception("NATS handler failed for subject %s", message.subject)
 
-            await self._nats_client.subscribe(">", cb=handler)
-            LOGGER.info("Subscribed to NATS events on nats://127.0.0.1:4222")
+            await self._nats_client.subscribe("cerebellum.events.>", cb=handler)
+            LOGGER.info("Subscribed to cerebellum.events.> on nats://127.0.0.1:4222")
 
             while not self.stop_requested:
                 await asyncio.sleep(1)
@@ -134,33 +91,30 @@ class ObservatoryService:
             await self._shutdown()
 
     async def _shutdown(self) -> None:
-        if hasattr(self, '_dashboard_proc') and self._dashboard_proc is not None:
-            try:
-                self._dashboard_proc.terminate()
-                self._dashboard_proc.wait(timeout=5)
-            except Exception:
-                LOGGER.exception("Failed to terminate dashboard subprocess")
         if self._nats_client is not None:
             try:
                 await self._nats_client.drain()
             except Exception:
                 LOGGER.exception("Failed to drain NATS client")
         if self._emitter is not None:
-            stop_method = getattr(self._emitter, "stop", None)
-            if callable(stop_method):
-                try:
-                    result = stop_method()
-                    if asyncio.iscoroutine(result):
-                        await result
-                except Exception:
-                    LOGGER.exception("Emitter shutdown failed")
-    def _write_event(self, topic: str, payload: dict[str, Any]) -> None:
-        with sqlite3.connect(DB_PATH) as connection:
-            connection.execute(
-                "INSERT INTO events(topic, payload, created_at) VALUES (?, ?, ?)",
-                (topic, json.dumps(payload), datetime.utcnow().isoformat()),
+            try:
+                self._emitter.close()
+            except Exception:
+                LOGGER.exception("Emitter shutdown failed")
+
+    def _relay_event(self, topic: str, data: str) -> None:
+        """Relay NATS events through the single emitter (→ events.db + JetStream)."""
+        if self._emitter is None:
+            return
+        try:
+            event_type = topic.replace("cerebellum.events.", "", 1)
+            self._emitter.emit(
+                event_type,
+                payload={"subject": topic, "data": data},
+                actor="observatory.nats-subscriber",
             )
-            connection.commit()
+        except Exception:
+            LOGGER.exception("Failed to relay NATS event %s through emitter", topic)
 
 
 async def _async_main() -> int:

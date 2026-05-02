@@ -10,7 +10,7 @@ import urllib.error
 import urllib.request
 from collections import Counter
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 import kuzu
 from typing import Any
@@ -29,7 +29,7 @@ class Hippocampus:
     """Causal memory engine using KuzuDB graph + Qdrant vectors."""
 
     GRAPH_DIR = Path("/home/josh/.openclaw/cerebellum/graph")
-    DEFAULT_OPENROUTER_MODEL = "openai/gpt-5.5"
+    DEFAULT_OPENROUTER_MODEL = "openai/gpt-4o"
     DEFAULT_OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
     _READ_ONLY_QUERY_PREFIXES = ("MATCH", "WITH", "RETURN", "CALL", "UNWIND")
     _READ_ONLY_BLOCKLIST = re.compile(r"\b(CREATE|MERGE|DELETE|DETACH|SET|DROP|COPY|LOAD|REMOVE)\b", re.IGNORECASE)
@@ -241,7 +241,7 @@ class Hippocampus:
         return list(entities.values())
 
     def mine_causal_edges(self, window_hours: int = 168) -> list[dict[str, Any]]:
-        since = (datetime.now(UTC) - timedelta(hours=window_hours)).isoformat()
+        since = (datetime.now(timezone.utc) - timedelta(hours=window_hours)).isoformat()
         discovered: list[dict[str, Any]] = []
 
         try:
@@ -276,6 +276,10 @@ class Hippocampus:
                 )
             except Exception as exc:
                 logger.debug("Skipping unparsable event row during causal mining: %s", exc)
+
+        if len(parsed_rows) > 500:
+            logger.warning("Causal mining capped to 500 events (had %d)", len(parsed_rows))
+            parsed_rows = parsed_rows[:500]
 
         support_counts: Counter[tuple[str, str]] = Counter()
         source_counts: Counter[str] = Counter()
@@ -674,9 +678,12 @@ User request: {natural_language}
         except (TimeoutError, urllib.error.URLError, urllib.error.HTTPError, json.JSONDecodeError) as exc:
             raise RuntimeError(f"OpenRouter request failed: {exc}") from exc
 
-        text = self._read_nested_key(response_payload, "choices.0.message.content")
-        if not isinstance(text, str) or not text.strip():
-            raise RuntimeError("OpenRouter response missing text")
+        try:
+            text = self._read_nested_key(response_payload, "choices.0.message.content")
+            if not isinstance(text, str) or not text.strip():
+                raise RuntimeError("OpenRouter response missing text")
+        except TypeError as exc:
+            raise RuntimeError(f"OpenRouter response parsing failed: {exc}") from exc
         return LLMResponse(text=text.strip(), raw=response_payload)
 
     def _read_nested_key(self, payload: dict[str, Any], key_path: str) -> Any:
@@ -727,3 +734,18 @@ User request: {natural_language}
         if parsed.tzinfo is None:
             parsed = parsed.replace(tzinfo=UTC)
         return parsed.astimezone(UTC)
+
+    def close(self) -> None:
+        db = getattr(self, "_db", None)
+        if db is None:
+            return
+
+        close = getattr(db, "close", None)
+        if not callable(close):
+            logger.debug("KuzuDB connection does not expose close(); skipping shutdown")
+            return
+
+        try:
+            close()
+        except Exception as exc:
+            logger.error("Failed to close KuzuDB connection: %s", exc)

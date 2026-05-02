@@ -40,7 +40,7 @@ class Hypothesis:
 class PrefrontalCortex:
     """Hypothesis generation engine."""
 
-    DEFAULT_MODELS = ["openai/gpt-5.5", "anthropic/claude-opus-4.7"]
+    DEFAULT_MODELS = ["openai/gpt-4o", "anthropic/claude-opus-4.7"]
     VALID_STATES = {"proposed", "staged", "executed", "rejected", "expired"}
     VALID_REVERSIBILITY = {"full", "partial", "none"}
 
@@ -135,13 +135,13 @@ class PrefrontalCortex:
             events = self._get_recent_events(minutes=30)
             existing = self.get_active_hypotheses(state="proposed", limit=25)
             prompt = self._build_prompt(episodes=episodes, events=events, existing=existing)
-            raw_hypotheses = self._call_llm(prompt)
+            raw_hypotheses, usage = self._call_llm(prompt)
             if not raw_hypotheses:
                 return []
 
             stored: list[Hypothesis] = []
             for item in raw_hypotheses:
-                hypothesis = self._coerce_hypothesis(item, episodes=episodes, events=events)
+                hypothesis = self._coerce_hypothesis(item, episodes=episodes, events=events, usage=usage)
                 if hypothesis is None:
                     continue
                 if self._is_duplicate(hypothesis, existing + [entry.to_dict() for entry in stored]):
@@ -207,10 +207,10 @@ class PrefrontalCortex:
             logger.error("Failed to build hypothesis prompt: %s", exc)
             return "Return an empty JSON array: []"
 
-    def _call_llm(self, prompt: str) -> list[dict]:
+    def _call_llm(self, prompt: str) -> tuple[list[dict], dict[str, int]]:
         """Call OpenRouter API for hypothesis generation."""
         if self._client is None:
-            return []
+            return [], {}
 
         for model in self.model_candidates:
             for attempt in range(3):
@@ -226,13 +226,14 @@ class PrefrontalCortex:
                             {"role": "user", "content": prompt},
                         ],
                     )
+                    usage = self._extract_usage(response)
                     content = self._clean_json_content(self._extract_message_content(response))
                     parsed = json.loads(content)
                     hypotheses = parsed.get("hypotheses") if isinstance(parsed, dict) else parsed
                     if isinstance(hypotheses, list):
-                        return [item for item in hypotheses if isinstance(item, dict)]
+                        return [item for item in hypotheses if isinstance(item, dict)], usage
                     logger.error("LLM returned non-list payload for model %s", model)
-                    return []
+                    return [], usage
                 except Exception as exc:
                     if attempt >= 2:
                         logger.error("LLM call failed for model %s after retries: %s", model, exc)
@@ -246,12 +247,32 @@ class PrefrontalCortex:
                         delay,
                     )
                     time.sleep(delay)
-        return []
+        return [], {}
+
+    def _extract_usage(self, response: Any) -> dict[str, int]:
+        usage = getattr(response, "usage", None)
+        prompt_tokens = int(getattr(usage, "prompt_tokens", 0) or 0)
+        completion_tokens = int(getattr(usage, "completion_tokens", 0) or 0)
+        total_tokens = int(getattr(usage, "total_tokens", 0) or (prompt_tokens + completion_tokens))
+        logger.info(
+            "LLM usage: prompt=%s completion=%s total=%s",
+            prompt_tokens,
+            completion_tokens,
+            total_tokens,
+        )
+        return {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": total_tokens,
+        }
 
     def _extract_message_content(self, response: Any) -> str:
         try:
-            message = response.choices[0].message
-            content = message.content
+            try:
+                message = response.choices[0].message
+                content = message.content
+            except TypeError as exc:
+                raise ValueError(f"Unable to extract LLM content: {exc}") from exc
             if isinstance(content, str):
                 return content
             if isinstance(content, list):
@@ -260,7 +281,10 @@ class PrefrontalCortex:
                     if isinstance(chunk, dict) and chunk.get("type") == "text":
                         fragments.append(str(chunk.get("text", "")))
                     else:
-                        text_value = getattr(chunk, "text", None)
+                        try:
+                            text_value = getattr(chunk, "text", None)
+                        except TypeError as exc:
+                            raise ValueError(f"Unable to extract LLM content: {exc}") from exc
                         if text_value:
                             fragments.append(str(text_value))
                 return "".join(fragments)
@@ -488,7 +512,13 @@ class PrefrontalCortex:
             return value.isoformat()
         return str(value)
 
-    def _coerce_hypothesis(self, item: dict[str, Any], episodes: list, events: list) -> Optional[Hypothesis]:
+    def _coerce_hypothesis(
+        self,
+        item: dict[str, Any],
+        episodes: list,
+        events: list,
+        usage: dict[str, int] | None = None,
+    ) -> Optional[Hypothesis]:
         try:
             title = str(item.get("title", "")).strip()
             description = str(item.get("description", "")).strip()
@@ -507,6 +537,16 @@ class PrefrontalCortex:
             metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
             metadata.setdefault("source", "llm")
             metadata.setdefault("model_candidates", self.model_candidates)
+            usage = usage or {}
+            prompt_tokens = int(usage.get("prompt_tokens", 0) or 0)
+            completion_tokens = int(usage.get("completion_tokens", 0) or 0)
+            derived_cost = self._derive_cost(prompt_tokens, completion_tokens)
+            logger.info(
+                "Derived hypothesis cost from usage: prompt=%s completion=%s cost=%.6f",
+                prompt_tokens,
+                completion_tokens,
+                derived_cost,
+            )
             return Hypothesis(
                 id=str(uuid.uuid4()),
                 timestamp=datetime.now(timezone.utc).isoformat(),
@@ -514,7 +554,7 @@ class PrefrontalCortex:
                 description=description,
                 confidence=self._clamp_float(item.get("confidence", 0.0)),
                 utility=self._clamp_float(item.get("utility", 0.0)),
-                cost=self._clamp_float(item.get("cost", 0.0)),
+                cost=derived_cost,
                 reversibility=reversibility,
                 plan=plan,
                 tools_required=tools_required,
@@ -525,6 +565,10 @@ class PrefrontalCortex:
         except Exception as exc:
             logger.warning("Discarding invalid hypothesis payload %s: %s", item, exc)
             return None
+
+    def _derive_cost(self, prompt_tokens: int, completion_tokens: int) -> float:
+        cost = (max(0, prompt_tokens) + max(0, completion_tokens)) * 0.000001
+        return max(0.0, min(1.0, round(cost, 6)))
 
     def _fallback_context_summary(self, episodes: list, events: list) -> str:
         return (

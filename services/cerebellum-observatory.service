@@ -1,17 +1,19 @@
 [Unit]
 Description=Cerebellum Observatory (Event Stream)
-After=openclaw-gateway.service
-Wants=openclaw-gateway.service
+After=network-online.target openclaw-gateway.service
+Wants=network-online.target openclaw-gateway.service
 
 [Service]
 Type=simple
 WorkingDirectory=/home/josh/.openclaw/cerebellum
-ExecStart=/usr/bin/python3 -m cerebellum.observatory_main
+ExecStart=/usr/bin/python3 /home/josh/.openclaw/cerebellum/src/observatory_main.py
 Restart=on-failure
 RestartSec=10
+WatchdogSec=30
 Environment=PYTHONUNBUFFERED=1
-# OPENROUTER_API_KEY should be injected by the user environment.
-Environment=OPENROUTER_API_KEY=%i
+EnvironmentFile=/home/josh/.openclaw/cerebellum/.env
+MemoryMax=2G
+TasksMax=200
 
 [Install]
 WantedBy=default.target
