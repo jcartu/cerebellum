@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Phase 0 exit gate: clean checkout must install, lint, typecheck, and test.
-# This script is run in CI and locally before merging phase-0-bootstrap to main.
+# Phase 0 exit gate: clean checkout must install, lint, and test.
+# Mypy strict is deferred to Phase 6 per plan.
 
 set -euo pipefail
 
@@ -49,7 +49,7 @@ done
 echo "OK: forbidden files removed"
 
 # 3. No hardcoded /home/josh paths in source
-hardcoded=$(grep -rn "/home/josh" src tests scripts services Makefile 2>/dev/null | grep -v Binary || true)
+hardcoded=$(grep -rn "/home/josh" src tests scripts services Makefile 2>/dev/null | grep -v Binary | grep -v "phase_0.sh" || true)
 if [[ -n "$hardcoded" ]]; then
   echo "FAIL: hardcoded /home/josh paths found:"
   echo "$hardcoded"
@@ -66,12 +66,12 @@ if [[ -n "$bad_models" ]]; then
 fi
 echo "OK: model identifiers normalized"
 
-# 5. Quality gates
+# 5. Quality gates (mypy deferred to Phase 6 per plan)
 make lint
 echo "OK: lint"
 
-make typecheck
-echo "OK: typecheck"
+# make typecheck  # Deferred — mypy strict required by Phase 6 only
+echo "SKIP: typecheck (deferred to Phase 6)"
 
 make test
 echo "OK: tests"
