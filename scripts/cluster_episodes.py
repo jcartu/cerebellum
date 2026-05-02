@@ -17,7 +17,7 @@ from events import CerebellumEventEmitter  # noqa: E402
 from hippocampus import Hippocampus  # noqa: E402
 
 
-logger = logging.getLogger("cerebellum.cluster_episodes")
+logger = logging.getLogger(__name__)
 
 
 def cluster_by_time(events: list[dict[str, Any]], threshold_minutes: int = 5) -> list[list[dict[str, Any]]]:

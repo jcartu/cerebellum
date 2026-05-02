@@ -11,7 +11,7 @@ if str(SRC_DIR) not in sys.path:
 
 from cortex import PrefrontalCortex  # noqa: E402
 
-logger = logging.getLogger("cerebellum.scripts.generate_hypotheses")
+logger = logging.getLogger(__name__)
 
 
 def main() -> int:
@@ -31,6 +31,8 @@ def main() -> int:
             emitter = CerebellumEventEmitter(config_path)
             logger.info("Emitter loaded")
         except Exception:
+            # Optional dependency wiring may fail in reduced environments; continue with degraded context.
+            logger.debug("Emitter wiring skipped", exc_info=True)
             logger.warning("Emitter unavailable (hypotheses will lack recent event context)")
 
         # Wire hippocampus for episode context
@@ -41,6 +43,8 @@ def main() -> int:
             hippocampus = Hippocampus(config_path)
             logger.info("Hippocampus loaded")
         except Exception:
+            # Optional dependency wiring may fail in reduced environments; continue with degraded context.
+            logger.debug("Hippocampus wiring skipped", exc_info=True)
             logger.warning("Hippocampus unavailable (hypotheses will lack episode context)")
 
         cortex = PrefrontalCortex(

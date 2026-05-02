@@ -4,11 +4,12 @@ import asyncio
 import inspect
 import json
 import logging
+import os
 import sqlite3
 import threading
 import uuid
-from concurrent.futures import Future
-from datetime import datetime
+from concurrent.futures import Future, wait
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
@@ -16,7 +17,7 @@ from nats.aio.client import Client as NATS
 from nats.aio.msg import Msg
 
 
-logger = logging.getLogger("cerebellum.events")
+logger = logging.getLogger(__name__)
 
 
 class CerebellumEventEmitter:
@@ -29,6 +30,10 @@ class CerebellumEventEmitter:
         self._db_lock = threading.Lock()
         self._sqlite = sqlite3.connect(self.db_path, check_same_thread=False)
         self._sqlite.row_factory = sqlite3.Row
+        self._checkpoint_interval_seconds = 300
+        self._checkpoint_stop = threading.Event()
+        self._checkpoint_thread: threading.Thread | None = None
+        self._close_publish_timeout_seconds = 5.0
         self._configure_sqlite()
 
         self._loop = asyncio.new_event_loop()
@@ -45,6 +50,7 @@ class CerebellumEventEmitter:
         self._inflight_lock = threading.RLock()
 
         self._connect_to_nats()
+        self._start_checkpoint_worker()
 
     def emit(
         self,
@@ -56,7 +62,7 @@ class CerebellumEventEmitter:
         event_id = str(uuid.uuid4())
         event = {
             "id": event_id,
-            "timestamp": datetime.now().astimezone().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
             "type": event_type,
             "payload": payload,
             "actor": actor,
@@ -86,7 +92,8 @@ class CerebellumEventEmitter:
                             try:
                                 self._inflight_publishes.remove(f)
                             except ValueError:
-                                pass
+                                # Another cleanup path may have already removed this completed future.
+                                logger.debug("Publish future for event %s already removed from inflight list", _eid)
 
                 fut.add_done_callback(_on_done)
             except RuntimeError:
@@ -94,6 +101,21 @@ class CerebellumEventEmitter:
         else:
             logger.debug("NATS unavailable, stored event %s in SQLite only", event_id)
         return event_id
+
+    def write_event(self, event: dict[str, Any]) -> None:
+        required_keys = {"id", "timestamp", "type", "payload", "actor", "context"}
+        if not required_keys.issubset(event):
+            missing = sorted(required_keys.difference(event))
+            raise ValueError(f"Event payload missing required keys: {', '.join(missing)}")
+        normalized_event = {
+            "id": str(event["id"]),
+            "timestamp": str(event["timestamp"] or datetime.now(timezone.utc).isoformat()),
+            "type": str(event["type"] or "unknown"),
+            "payload": event["payload"] if isinstance(event["payload"], dict) else {},
+            "actor": str(event["actor"] or "system"),
+            "context": event["context"] if isinstance(event["context"], dict) else {},
+        }
+        self._write_event(normalized_event, insert_mode="OR IGNORE")
 
     def query(
         self,
@@ -111,7 +133,7 @@ class CerebellumEventEmitter:
             params.extend(types)
         if since:
             conditions.append("timestamp >= ?")
-            params.append(since.astimezone().isoformat())
+            params.append(since.astimezone(timezone.utc).isoformat())
 
         if conditions:
             sql += " WHERE " + " AND ".join(conditions)
@@ -144,6 +166,9 @@ class CerebellumEventEmitter:
             self._subscription_futures.append(future)
 
     def close(self) -> None:
+        self._checkpoint_stop.set()
+        if self._checkpoint_thread is not None:
+            self._checkpoint_thread.join(timeout=2)
         try:
             if self._nats_ready and self._nc:
                 future = asyncio.run_coroutine_threadsafe(self._nc.drain(), self._loop)
@@ -152,6 +177,14 @@ class CerebellumEventEmitter:
             logger.warning("Failed to drain NATS connection cleanly: %s", exc)
         finally:
             self._nats_ready = False
+
+        remaining_inflight = self._wait_for_inflight_publishes(self._close_publish_timeout_seconds)
+        if remaining_inflight:
+            logger.warning(
+                "Event emitter closed with %d publish(es) still inflight after %.1fs timeout",
+                remaining_inflight,
+                self._close_publish_timeout_seconds,
+            )
 
         with self._db_lock:
             self._sqlite.close()
@@ -174,6 +207,7 @@ class CerebellumEventEmitter:
             with self._db_lock:
                 self._sqlite.execute("PRAGMA journal_mode=WAL;")
                 self._sqlite.execute("PRAGMA synchronous=NORMAL;")
+                self._sqlite.execute("PRAGMA wal_autocheckpoint=1000;")
                 self._sqlite.execute(
                     """
                     CREATE TABLE IF NOT EXISTS events (
@@ -197,6 +231,22 @@ class CerebellumEventEmitter:
             logger.error("Failed to configure SQLite backing store: %s", exc)
             raise
 
+    def _start_checkpoint_worker(self) -> None:
+        self._checkpoint_thread = threading.Thread(
+            target=self._checkpoint_worker,
+            name="cerebellum-events-wal-checkpoint",
+            daemon=True,
+        )
+        self._checkpoint_thread.start()
+
+    def _checkpoint_worker(self) -> None:
+        while not self._checkpoint_stop.wait(self._checkpoint_interval_seconds):
+            try:
+                with self._db_lock:
+                    self._sqlite.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+            except Exception as exc:
+                logger.warning("SQLite WAL checkpoint failed: %s", exc)
+
     def _run_loop(self) -> None:
         asyncio.set_event_loop(self._loop)
         self._loop.run_forever()
@@ -212,10 +262,7 @@ class CerebellumEventEmitter:
     async def _connect_to_nats_async(self) -> None:
         nats_config = self.config.get("nats", {})
         servers = [f"nats://{nats_config.get('host', 'localhost')}:{nats_config.get('port', 4222)}"]
-        auth_token = (
-            nats_config.get("auth_token")
-            or __import__("os").environ.get("CEREBELLUM_NATS_TOKEN", "")
-        ).strip()
+        auth_token = os.environ.get("CEREBELLUM_NATS_TOKEN", "").strip()
         if not auth_token:
             raise RuntimeError(
                 "CEREBELLUM_NATS_TOKEN is not configured; refusing to connect to NATS unauthenticated"
@@ -234,7 +281,9 @@ class CerebellumEventEmitter:
                 self._js = self._nc.jetstream(domain=nats_config.get("jetstream_domain") or None)
                 try:
                     await self._js.stream_info("CEREBELLUM_EVENTS")
-                except Exception:
+                except Exception as exc:
+                    # Stream discovery can fail during first bootstrap; log at debug before creating it.
+                    logger.debug("JetStream stream_info failed during bootstrap: %s", exc)
                     await self._js.add_stream(
                         name="CEREBELLUM_EVENTS", subjects=["cerebellum.events.>"]
                     )
@@ -258,14 +307,15 @@ class CerebellumEventEmitter:
                 await asyncio.sleep(delay)
         raise RuntimeError(f"NATS connection failed after retries: {last_exc}")
 
-    def _write_event(self, event: dict[str, Any]) -> None:
+    def _write_event(self, event: dict[str, Any], insert_mode: str = "") -> None:
         try:
+            insert_clause = f"INSERT {insert_mode}".strip()
             with self._db_lock:
                 self._sqlite.execute(
                     """
-                    INSERT INTO events (id, timestamp, type, payload, actor, context)
+                    {insert_clause} INTO events (id, timestamp, type, payload, actor, context)
                     VALUES (?, ?, ?, ?, ?, ?)
-                    """,
+                    """.format(insert_clause=insert_clause),
                     (
                         event["id"],
                         event["timestamp"],
@@ -290,6 +340,17 @@ class CerebellumEventEmitter:
         except Exception as exc:
             logger.error("JetStream publish failed on %s: %s", subject, exc)
             raise
+
+    def _wait_for_inflight_publishes(self, timeout_seconds: float) -> int:
+        with self._inflight_lock:
+            pending = [future for future in self._inflight_publishes if not future.done()]
+        if not pending:
+            return 0
+
+        _, still_pending = wait(pending, timeout=timeout_seconds)
+        with self._inflight_lock:
+            self._inflight_publishes = [future for future in self._inflight_publishes if not future.done()]
+            return len([future for future in self._inflight_publishes if future in still_pending])
 
     async def _subscribe(self, callback: Callable[[dict[str, Any]], Any]) -> None:
         if not self._nc:

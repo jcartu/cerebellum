@@ -11,7 +11,6 @@ Group=josh
 ExecStart=/home/linuxbrew/.linuxbrew/bin/python3 /home/josh/.openclaw/cerebellum/src/observatory_main.py
 Restart=on-failure
 RestartSec=10
-WatchdogSec=30
 Environment=PYTHONUNBUFFERED=1
 EnvironmentFile=/home/josh/.openclaw/cerebellum/.env
 MemoryMax=2G

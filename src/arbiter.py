@@ -1,7 +1,14 @@
+"""Policy-driven action arbiter for evaluating and executing hypotheses."""
+
 import json
 import logging
+import math
 import os
+import ipaddress
+import fnmatch
 import re
+import shutil
+import stat
 import subprocess
 import threading
 import time
@@ -10,6 +17,7 @@ import urllib.parse
 import urllib.request
 import uuid
 from http.client import HTTPSConnection
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -17,7 +25,34 @@ from typing import Any, Optional
 
 import yaml
 
-logger = logging.getLogger("cerebellum.arbiter")
+try:
+    from .http_safe import NoRedirectHandler, _safe_opener
+except ImportError:
+    from http_safe import NoRedirectHandler, _safe_opener
+
+logger = logging.getLogger(__name__)
+
+RECENT_DECISIONS_MAX = 50
+RECENT_DECISIONS_STATUS_LIMIT = 10
+DEFAULT_HTTP_REFERER = "https://openclaw.local/cerebellum"
+OPENCLAW_FALLBACK_BINARY_PATHS = (
+    Path.home() / ".npm-global" / "bin" / "openclaw",
+    Path("/usr/local/bin/openclaw"),
+    Path("/usr/bin/openclaw"),
+)
+SENSITIVE_HYPOTHESIS_FIELD_TOKENS = (
+    "api_key",
+    "api_keys",
+    "token",
+    "tokens",
+    "password",
+    "passwords",
+    "secret",
+    "secrets",
+    "authorization",
+    "credential",
+    "credentials",
+)
 
 
 @dataclass
@@ -42,14 +77,18 @@ class RateLimiter:
     def __init__(self, max_count: int, window_seconds: int):
         self.max_count = max_count
         self.window_seconds = window_seconds
-        self.events: list[float] = []
+        self.events: deque[float] = deque(maxlen=max_count + 10)
         self._lock = threading.RLock()
+
+    def _prune(self, now: float) -> None:
+        cutoff = now - self.window_seconds
+        while self.events and self.events[0] <= cutoff:
+            self.events.popleft()
 
     def allow(self) -> bool:
         with self._lock:
             now = time.monotonic()
-            cutoff = now - self.window_seconds
-            self.events = [event for event in self.events if event > cutoff]
+            self._prune(now)
             if len(self.events) >= self.max_count:
                 return False
             self.events.append(now)
@@ -58,8 +97,7 @@ class RateLimiter:
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
             now = time.monotonic()
-            cutoff = now - self.window_seconds
-            self.events = [event for event in self.events if event > cutoff]
+            self._prune(now)
             return {
                 "max_count": self.max_count,
                 "window_seconds": self.window_seconds,
@@ -79,13 +117,14 @@ class DailyCostTracker:
 
     def allow(self, additional_cost: float) -> bool:
         with self._lock:
+            additional = max(additional_cost, 0.0)
             today = datetime.now(timezone.utc).date()
             if today != self._day:
                 self._day = today
                 self._spent = 0.0
-            if self._spent + max(additional_cost, 0.0) > self.max_cost:
+            if self._spent + additional > self.max_cost:
                 return False
-            self._spent += max(additional_cost, 0.0)
+            self._spent += additional
             return True
 
     def snapshot(self) -> dict[str, Any]:
@@ -102,21 +141,6 @@ class DailyCostTracker:
             }
 
 
-class _NoRedirectHandler(urllib.request.HTTPErrorProcessor):
-    def http_response(self, request: urllib.request.Request, response: Any) -> Any:
-        if response.status in (301, 302, 303, 307, 308):
-            raise urllib.error.HTTPError(
-                response.url,
-                response.status,
-                "Redirect forbidden",
-                response.headers,
-                None,
-            )
-        return response
-
-    https_response = http_response
-
-
 class _PinnedHTTPSConnection(HTTPSConnection):
     def __init__(self, *args: Any, connect_host: str, server_hostname: str | None = None, **kwargs: Any):
         self._connect_host = connect_host
@@ -124,10 +148,20 @@ class _PinnedHTTPSConnection(HTTPSConnection):
         super().__init__(*args, **kwargs)
 
     def connect(self) -> None:
+        self.host = self._connect_host
         self.sock = self._create_connection((self._connect_host, self.port), self.timeout, self.source_address)
+        peer_ip = self._normalize_ip_address(self.sock.getpeername()[0])
+        expected_ip = self._normalize_ip_address(self._connect_host)
+        if peer_ip != expected_ip:
+            self.sock.close()
+            raise ValueError(f"Pinned HTTPS peer mismatch: expected {expected_ip}, got {peer_ip}")
         if self._tunnel_host:
             self._tunnel()
         self.sock = self._context.wrap_socket(self.sock, server_hostname=self._server_hostname or self.host)
+
+    @staticmethod
+    def _normalize_ip_address(value: str) -> str:
+        return str(ipaddress.ip_address(value))
 
 
 class _PinnedHTTPSHandler(urllib.request.HTTPSHandler):
@@ -148,9 +182,6 @@ class _PinnedHTTPSHandler(urllib.request.HTTPSHandler):
         )
 
 
-_safe_opener = urllib.request.build_opener(_NoRedirectHandler())
-
-
 class BasalGanglia:
     """Action arbiter - decides what to do with hypotheses."""
 
@@ -164,6 +195,7 @@ class BasalGanglia:
         self.state_file = self.state_dir / "arbiter_state.json"
         self.decisions_file = self.state_dir / "arbiter_decisions.jsonl"
         self.kill_switch_file = self.state_dir / "kill_switch.flag"
+        self.runtime_config_path = self.base_dir / "config.json"
         self.emitter = emitter
         self.cortex = cortex
         self._lock = threading.RLock()
@@ -175,21 +207,48 @@ class BasalGanglia:
             raise RuntimeError(f"Unable to load arbiter policy from {self.config_path}") from exc
 
         global_cfg = self.policy.get("global", {})
+        self.runtime_config = self._load_runtime_config()
         self.kill_switch = not bool(global_cfg.get("enabled", True))
         self.kill_switch_command = str(global_cfg.get("kill_switch_command", "/cerebellum-halt"))
         self.action_limiter = RateLimiter(int(global_cfg.get("max_actions_per_hour", 10)), 3600)
         self.cost_limiter = DailyCostTracker(float(global_cfg.get("max_llm_cost_per_day_usd", 5.0)))
-        self.recent_decisions: list[dict[str, Any]] = []
+        self.recent_decisions: list[ActionDecision] = []
         self._load_state()
 
     def evaluate(self, hypothesis: dict) -> ActionDecision:
         hypothesis_id = str(hypothesis.get("id") or hypothesis.get("hypothesis_id") or uuid.uuid4())
-        confidence = float(hypothesis.get("confidence") or 0.0)
+        daily_budget = float(self.cost_limiter.max_cost)
+        raw_confidence = hypothesis.get("confidence")
+        raw_cost = hypothesis.get("cost")
+        try:
+            confidence = float(raw_confidence or 0.0)
+            cost = float(raw_cost or 0.0)
+        except (TypeError, ValueError):
+            logger.warning(
+                "Rejected hypothesis %s: invalid numeric cost/confidence (confidence=%r, cost=%r)",
+                hypothesis_id,
+                raw_confidence,
+                raw_cost,
+            )
+            return self._record_decision(hypothesis_id, "discard", "invalid cost/confidence")
+        if not math.isfinite(confidence) or not math.isfinite(cost) or confidence < 0.0 or cost < 0.0:
+            logger.warning(
+                "Rejected hypothesis %s: non-finite or negative cost/confidence (confidence=%r, cost=%r)",
+                hypothesis_id,
+                raw_confidence,
+                raw_cost,
+            )
+            return self._record_decision(hypothesis_id, "discard", "invalid cost/confidence")
+        if confidence > 1.0:
+            logger.warning("Clamped hypothesis %s confidence from %s to 1.0", hypothesis_id, confidence)
+            confidence = 1.0
+        if cost > daily_budget:
+            logger.warning("Clamped hypothesis %s cost from %s to daily budget %s", hypothesis_id, cost, daily_budget)
+            cost = daily_budget
         # NOTE: `cost` here is the hypothesis-generation LLM token cost ONLY.
         # It is NOT the cost of executing the plan. Execution cost is not
         # currently modeled — see audit H8. The budget check below therefore
         # only rate-limits hypothesis-generation spend, not tool-execution spend.
-        cost = float(hypothesis.get("cost") or 0.0)
         reversibility = str(hypothesis.get("reversibility") or "unknown")
         tools = self._extract_tools(hypothesis)
 
@@ -246,7 +305,7 @@ class BasalGanglia:
         hypothesis_id = str(hypothesis.get("id") or hypothesis.get("hypothesis_id") or uuid.uuid4())
         self._refresh_kill_switch_from_disk()
         if self.kill_switch:
-            logging.warning("auto_execute blocked by kill switch: %s", hypothesis_id)
+            logger.warning("auto_execute blocked by kill switch: %s", hypothesis_id)
             return {
                 "hypothesis_id": hypothesis_id,
                 "status": "blocked",
@@ -254,13 +313,30 @@ class BasalGanglia:
                 "results": [],
                 "reason": "kill switch enabled",
             }
+        daily_budget = float(self.policy.get("global", {}).get("max_llm_cost_per_day_usd", 5.0))
+        auto_cfg = self.policy.get("auto_execute", {})
+        execution_cost_limit = float(auto_cfg.get("execution_cost_limit_usd", daily_budget * 0.5))
         results: list[dict[str, Any]] = []
         success = True
+        execution_cost = 0.0
+        halted_for_budget = False
         for step in self._extract_plan(hypothesis):
             tool_name = str(step.get("tool") or step.get("action") or "")
             try:
                 result = self._execute_step(tool_name, step)
-                results.append({"tool": tool_name, "ok": True, "result": result})
+                step_cost = self._extract_execution_cost(step, result)
+                execution_cost += step_cost
+                results.append({"tool": tool_name, "ok": True, "cost": step_cost, "result": result})
+                if execution_cost > execution_cost_limit:
+                    halted_for_budget = True
+                    success = False
+                    logger.warning(
+                        "Auto-execution halted for %s: execution cost %.4f exceeded limit %.4f",
+                        hypothesis_id,
+                        execution_cost,
+                        execution_cost_limit,
+                    )
+                    break
             except Exception as exc:
                 logger.exception("Auto-execution failed for %s step %s", hypothesis_id, tool_name)
                 success = False
@@ -270,18 +346,23 @@ class BasalGanglia:
             "hypothesis_id": hypothesis_id,
             "status": "completed" if success else "partial_failure",
             "executed_at": datetime.now(timezone.utc).isoformat(),
+            "execution_cost": round(execution_cost, 6),
+            "execution_cost_limit": round(execution_cost_limit, 6),
             "results": results,
         }
+        if halted_for_budget:
+            payload["reason"] = "execution cost budget exceeded"
         self._update_hypothesis_state(hypothesis_id, payload["status"], payload)
         self._emit_event("cerebellum.execution", payload)
         return payload
 
     def stage_for_approval(self, hypothesis: dict) -> str:
         hypothesis_id = str(hypothesis.get("id") or hypothesis.get("hypothesis_id") or uuid.uuid4())
+        sanitized_hypothesis = self._sanitize_hypothesis(hypothesis)
         timeout_minutes = int(
             self.policy.get("stage_notify", {}).get("telegram", {}).get("timeout_minutes", 60)
         )
-        message_text = self._format_telegram_card(hypothesis)
+        message_text = self._format_telegram_card(sanitized_hypothesis)
         keyboard = self._telegram_keyboard(hypothesis_id)
         message_id = f"local-{uuid.uuid4()}"
         telegram_result: dict[str, Any] | None = None
@@ -298,7 +379,7 @@ class BasalGanglia:
             "status": "pending",
             "staged_at": datetime.now(timezone.utc).isoformat(),
             "expires_at": (datetime.now(timezone.utc) + timedelta(minutes=timeout_minutes)).isoformat(),
-            "hypothesis": hypothesis,
+            "hypothesis": sanitized_hypothesis,
             "telegram_result": telegram_result,
         }
         import fcntl
@@ -321,14 +402,6 @@ class BasalGanglia:
         import fcntl
 
         lock_path = self.pending_file.with_suffix(".json.lock")
-        with self._lock:
-            with lock_path.open("w", encoding="utf-8") as lock_f:
-                fcntl.flock(lock_f.fileno(), fcntl.LOCK_EX)
-                try:
-                    pending = self._load_json(self.pending_file, default={})
-                    record = pending.get(hypothesis_id, {})
-                finally:
-                    fcntl.flock(lock_f.fileno(), fcntl.LOCK_UN)
         response = {
             "hypothesis_id": hypothesis_id,
             "decision": decision,
@@ -339,10 +412,30 @@ class BasalGanglia:
             if decision == "approve":
                 self._refresh_kill_switch_from_disk()
                 if self.kill_switch:
-                    logging.warning("handle_approval blocked by kill switch: %s", hypothesis_id)
+                    logger.warning("handle_approval blocked by kill switch: %s", hypothesis_id)
                     response["status"] = "blocked"
                     response["error"] = "kill switch enabled"
                     return response
+
+            with self._lock:
+                with lock_path.open("w", encoding="utf-8") as lock_f:
+                    fcntl.flock(lock_f.fileno(), fcntl.LOCK_EX)
+                    try:
+                        pending = self._load_json(self.pending_file, default={})
+                        record = pending.get(hypothesis_id, {})
+                        if decision == "snooze":
+                            record["expires_at"] = (
+                                datetime.now(timezone.utc) + timedelta(hours=1)
+                            ).isoformat()
+                            pending[hypothesis_id] = record
+                            self._save_json(self.pending_file, pending)
+                        elif decision in {"approve", "reject"}:
+                            pending.pop(hypothesis_id, None)
+                            self._save_json(self.pending_file, pending)
+                    finally:
+                        fcntl.flock(lock_f.fileno(), fcntl.LOCK_UN)
+
+            if decision == "approve":
                 hypothesis = record.get("hypothesis", {})
                 response["execution"] = self.auto_execute(hypothesis)
                 response["status"] = "approved"
@@ -352,16 +445,6 @@ class BasalGanglia:
                 self._update_hypothesis_state(hypothesis_id, "rejected", response)
             elif decision == "snooze":
                 response["status"] = "snoozed"
-                record["expires_at"] = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
-                with self._lock:
-                    with lock_path.open("w", encoding="utf-8") as lock_f:
-                        fcntl.flock(lock_f.fileno(), fcntl.LOCK_EX)
-                        try:
-                            pending = self._load_json(self.pending_file, default={})
-                            pending[hypothesis_id] = record
-                            self._save_json(self.pending_file, pending)
-                        finally:
-                            fcntl.flock(lock_f.fileno(), fcntl.LOCK_UN)
                 self._update_hypothesis_state(hypothesis_id, "snoozed", response)
             elif decision == "explain":
                 response["status"] = "explained"
@@ -370,17 +453,6 @@ class BasalGanglia:
                 ).get("summary", "No explanation available.")
             else:
                 response["status"] = "unknown_decision"
-
-            if decision in {"approve", "reject"}:
-                with self._lock:
-                    with lock_path.open("w", encoding="utf-8") as lock_f:
-                        fcntl.flock(lock_f.fileno(), fcntl.LOCK_EX)
-                        try:
-                            pending = self._load_json(self.pending_file, default={})
-                            pending.pop(hypothesis_id, None)
-                            self._save_json(self.pending_file, pending)
-                        finally:
-                            fcntl.flock(lock_f.fileno(), fcntl.LOCK_UN)
 
             self._emit_event("cerebellum.approval", response)
             return response
@@ -438,6 +510,51 @@ class BasalGanglia:
             logger.exception("Failed to read kill switch file %s", path)
             return None
 
+    def _load_runtime_config(self) -> dict[str, Any]:
+        try:
+            if self.runtime_config_path.exists():
+                return json.loads(self.runtime_config_path.read_text(encoding="utf-8"))
+        except Exception:
+            logger.exception("Failed to load runtime config from %s", self.runtime_config_path)
+        return {}
+
+    def _site_url(self) -> str:
+        env_value = (
+            os.environ.get("CEREBELLUM_HTTP_REFERER")
+            or os.environ.get("CEREBELLUM_SITE_URL")
+            or os.environ.get("OPENROUTER_HTTP_REFERER")
+            or ""
+        ).strip()
+        if env_value:
+            return env_value
+        config_value = str(self.runtime_config.get("http_referer") or "").strip()
+        if config_value:
+            return config_value
+        openrouter_cfg = self.runtime_config.get("openrouter")
+        if isinstance(openrouter_cfg, dict):
+            config_value = str(openrouter_cfg.get("http_referer") or "").strip()
+            if config_value:
+                return config_value
+        config_value = str(self.runtime_config.get("site_url") or "").strip()
+        if config_value:
+            return config_value
+        return DEFAULT_HTTP_REFERER
+
+    def _telegram_fallback_binary(self) -> str | None:
+        telegram_cfg = self.runtime_config.get("telegram") if isinstance(self.runtime_config.get("telegram"), dict) else {}
+        configured_binary = str(telegram_cfg.get("fallback_binary") or "").strip()
+        if configured_binary:
+            return configured_binary
+
+        discovered_binary = shutil.which("openclaw")
+        if discovered_binary:
+            return discovered_binary
+
+        legacy_binary = Path.home() / ".npm-global" / "bin" / "openclaw"
+        if legacy_binary.exists():
+            return str(legacy_binary)
+        return None
+
     def _write_kill_switch_file(self, enabled: bool) -> None:
         """Atomic write: write to temp file under flock, then os.replace."""
         import fcntl
@@ -459,13 +576,19 @@ class BasalGanglia:
                 finally:
                     fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
             os.replace(tmp_path, path)
+            parent_fd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            try:
+                os.fsync(parent_fd)
+            finally:
+                os.close(parent_fd)
         except Exception:
             logger.exception("Failed to write kill switch file %s", path)
             try:
                 if tmp_path.exists():
                     tmp_path.unlink()
             except Exception:
-                pass
+                # Best-effort cleanup only; keep the original write failure as the signal.
+                logger.debug("Ignoring temporary kill-switch cleanup failure for %s", tmp_path, exc_info=True)
 
     def _validate_url(self, url: str) -> tuple[str, str]:
         """SSRF guard: only allow http/https to public hosts.
@@ -540,9 +663,9 @@ class BasalGanglia:
             raise ValueError("file path must be a Path instance")
 
         try:
-            resolved = path.expanduser().resolve(strict=False)
+            resolved = Path(os.path.realpath(path.expanduser(), strict=True))
         except Exception as exc:
-            raise ValueError(f"Unable to resolve path {path}: {exc}") from exc
+            raise ValueError(f"Unable to resolve real path {path}: {exc}") from exc
 
         resolved_str = str(resolved)
 
@@ -571,15 +694,42 @@ class BasalGanglia:
             if pattern in resolved_str:
                 raise ValueError(f"Forbidden path pattern {pattern!r} in {resolved_str}")
 
-        # Env files: must match by prefix on the basename, not substring.
         basename = resolved.name
-        if basename.startswith(".env") or basename == "env" or basename.endswith(".env"):
-            raise ValueError(f"Refusing to read env file: {resolved_str}")
+        lower_basename = basename.lower()
+        allowed_suffixes = {
+            ".py",
+            ".md",
+            ".txt",
+            ".log",
+            ".yaml",
+            ".toml",
+            ".cfg",
+            ".ini",
+            ".sh",
+            ".html",
+            ".css",
+            ".js",
+            ".ts",
+        }
+        sensitive_patterns = (
+            ".env*",
+            "*.db",
+            "*.json",
+            "policy.yaml",
+            "*.flag",
+            "*.key",
+            "*.pem",
+            "*.crt",
+        )
+        if lower_basename != "config.json":
+            for pattern in sensitive_patterns:
+                if fnmatch.fnmatch(lower_basename, pattern):
+                    raise ValueError(f"Refusing to read sensitive file: {resolved_str}")
+        if resolved.suffix.lower() not in allowed_suffixes and lower_basename != "config.json":
+            raise ValueError(f"Refusing to read disallowed file type: {resolved_str}")
 
         allowed_roots = [
             self.base_dir.resolve(),
-            Path("/tmp").resolve(),
-            Path("/var/tmp").resolve(),
         ]
         for root in allowed_roots:
             try:
@@ -600,7 +750,7 @@ class BasalGanglia:
                 "cost": self.cost_limiter.snapshot(),
             },
             "pending_approvals": len(pending),
-            "recent_decisions": self.recent_decisions[-10:],
+            "recent_decisions": [decision.to_dict() for decision in self.recent_decisions[-RECENT_DECISIONS_STATUS_LIMIT:]],
         }
 
     def _record_decision(self, hypothesis_id: str, decision: str, reason: str) -> ActionDecision:
@@ -611,13 +761,27 @@ class BasalGanglia:
             timestamp=datetime.now(timezone.utc).isoformat(),
         )
         payload = action_decision.to_dict()
-        self.recent_decisions.append(payload)
-        self.recent_decisions = self.recent_decisions[-50:]
+        self.recent_decisions.append(action_decision)
+        self.recent_decisions = self.recent_decisions[-RECENT_DECISIONS_MAX:]
         self._append_jsonl(self.decisions_file, payload)
         logger.info("Arbiter decision %s for %s: %s", decision, hypothesis_id, reason)
         self._emit_event("cerebellum.action", payload)
         self._persist_state()
         return action_decision
+
+    def _sanitize_hypothesis(self, value: Any) -> Any:
+        if isinstance(value, dict):
+            sanitized: dict[str, Any] = {}
+            for key, item in value.items():
+                normalized_key = str(key).lower()
+                if any(token in normalized_key for token in SENSITIVE_HYPOTHESIS_FIELD_TOKENS):
+                    sanitized[str(key)] = "[REDACTED]"
+                    continue
+                sanitized[str(key)] = self._sanitize_hypothesis(item)
+            return sanitized
+        if isinstance(value, list):
+            return [self._sanitize_hypothesis(item) for item in value]
+        return value
 
     def _extract_plan(self, hypothesis: dict) -> list[dict[str, Any]]:
         plan = hypothesis.get("plan", [])
@@ -683,12 +847,18 @@ class BasalGanglia:
         )
         if parsed.scheme == "https":
             opener = urllib.request.build_opener(
-                _NoRedirectHandler(),
+                NoRedirectHandler(),
                 _PinnedHTTPSHandler(connect_host=safe_ip, server_hostname=parsed.hostname or ""),
             )
         else:
-            opener = urllib.request.build_opener(_NoRedirectHandler())
+            opener = urllib.request.build_opener(NoRedirectHandler())
         with opener.open(request, timeout=20) as response:
+            if parsed.scheme == "http":
+                response_host = response.headers.get("Host")
+                if response_host is not None and response_host != host_header:
+                    raise ValueError(
+                        f"HTTP response Host header mismatch: expected {host_header}, got {response_host}"
+                    )
             try:
                 http_status = getattr(response, "status", None)
                 content_type = response.headers.get("Content-Type")
@@ -732,11 +902,13 @@ class BasalGanglia:
         if not str(path):
             raise ValueError("file.read requires a path")
         self._validate_file_path(path)
-        content = path.read_text(encoding="utf-8")
+        resolved_path = path.expanduser().resolve(strict=True)
+        self._validate_file_path(resolved_path)
+        content = resolved_path.read_text(encoding="utf-8")
         return {
             "status": "ok",
             "tool": "file.read",
-            "path": str(path),
+            "path": str(resolved_path),
             "content": content[:10000],
             "truncated": len(content) > 10000,
         }
@@ -784,7 +956,7 @@ class BasalGanglia:
             headers={
                 "Authorization": f"Bearer {api_key}",
                 "Content-Type": "application/json",
-                "HTTP-Referer": "https://openclaw.local/cerebellum",
+                "HTTP-Referer": self._site_url(),
                 "X-Title": "CEREBELLUM",
             },
         )
@@ -809,8 +981,8 @@ class BasalGanglia:
         bot_token = os.environ.get("TELEGRAM_BOT_TOKEN") or os.environ.get("OPENCLAW_TELEGRAM_BOT_TOKEN")
         chat_id = os.environ.get("TELEGRAM_CHAT_ID") or os.environ.get("OPENCLAW_TELEGRAM_CHAT_ID")
         if not bot_token or not chat_id:
-            openclaw_bin = Path.home() / ".npm-global" / "bin" / "openclaw"
-            if openclaw_bin.exists():
+            openclaw_bin = self._resolve_openclaw_binary()
+            if openclaw_bin is not None:
                 command = [str(openclaw_bin), "agent", "--message", text, "--channel", "telegram", "--json"]
                 completed = subprocess.run(command, capture_output=True, text=True, timeout=120, check=False)
                 if completed.returncode != 0:
@@ -819,7 +991,13 @@ class BasalGanglia:
                     )
                 stdout = completed.stdout.strip() or "{}"
                 return {"ok": True, "source": "openclaw", "stdout": stdout}
-            raise RuntimeError("Telegram bot credentials are not configured")
+            logger.warning("Telegram bot credentials missing and no approved OpenClaw fallback is available")
+            return {
+                "ok": False,
+                "source": "openclaw",
+                "skipped": True,
+                "reason": "Telegram bot credentials are not configured",
+            }
 
         payload: dict[str, Any] = {"chat_id": chat_id, "text": text}
         if keyboard:
@@ -845,15 +1023,75 @@ class BasalGanglia:
                 body = body_bytes.decode("utf-8", errors="replace")
             raise RuntimeError(f"Telegram API error {exc.code}: {body}") from exc
 
+    def _extract_execution_cost(self, step: dict[str, Any], result: dict[str, Any]) -> float:
+        for source in (result, step):
+            for key in ("cost", "execution_cost", "estimated_cost"):
+                value = source.get(key)
+                try:
+                    if value is not None:
+                        return max(0.0, float(value))
+                except (TypeError, ValueError):
+                    logger.warning("Ignoring non-numeric execution cost %r for key %s", value, key)
+        return 0.0
+
+    def _resolve_openclaw_binary(self) -> Path | None:
+        telegram_cfg = self.runtime_config.get("telegram") if isinstance(self.runtime_config.get("telegram"), dict) else {}
+        configured_binary = str(telegram_cfg.get("fallback_binary") or "").strip()
+        allowed_paths = {path.expanduser().resolve(strict=False) for path in OPENCLAW_FALLBACK_BINARY_PATHS}
+        if configured_binary:
+            candidates = [Path(configured_binary).expanduser()]
+        else:
+            which_binary = shutil.which("openclaw")
+            candidates = []
+            if which_binary:
+                candidates.append(Path(which_binary))
+            candidates.extend(OPENCLAW_FALLBACK_BINARY_PATHS)
+        for candidate in candidates:
+            if not candidate.exists():
+                logger.warning("Skipping OpenClaw fallback at %s: binary not found", candidate)
+                continue
+            try:
+                resolved = candidate.resolve(strict=True)
+            except Exception as exc:
+                logger.warning("Skipping OpenClaw fallback at %s: %s", candidate, exc)
+                continue
+            if resolved not in allowed_paths:
+                logger.warning(
+                    "Skipping OpenClaw fallback at %s: resolved path %s is not in allowlist",
+                    candidate,
+                    resolved,
+                )
+                continue
+            if candidate.is_symlink() and self._is_world_writable_path(resolved.parent):
+                logger.warning(
+                    "Skipping OpenClaw fallback at %s: symlink target parent %s is world-writable",
+                    candidate,
+                    resolved.parent,
+                )
+                continue
+            if not os.access(resolved, os.X_OK):
+                logger.warning("Skipping OpenClaw fallback at %s: binary is not executable", candidate)
+                continue
+            return candidate
+        logger.warning("No approved OpenClaw fallback binary found")
+        return None
+
+    def _is_world_writable_path(self, path: Path) -> bool:
+        try:
+            mode = path.stat().st_mode
+        except OSError:
+            return True
+        return bool(mode & stat.S_IWOTH)
+
     def _telegram_keyboard(self, hypothesis_id: str) -> list[list[dict[str, str]]]:
         return [
             [
-                {"text": "✅ Approve", "callback_data": f"approve:{hypothesis_id}"},
-                {"text": "❌ Reject", "callback_data": f"reject:{hypothesis_id}"},
+                {"text": "Approve", "callback_data": f"approve:{hypothesis_id}"},
+                {"text": "Reject", "callback_data": f"reject:{hypothesis_id}"},
             ],
             [
-                {"text": "⏰ Snooze 1h", "callback_data": f"snooze:{hypothesis_id}"},
-                {"text": "❓ Explain", "callback_data": f"explain:{hypothesis_id}"},
+                {"text": "Snooze 1h", "callback_data": f"snooze:{hypothesis_id}"},
+                {"text": "Explain", "callback_data": f"explain:{hypothesis_id}"},
             ],
         ]
 
@@ -864,7 +1102,7 @@ class BasalGanglia:
         cost = hypothesis.get("estimated_cost") or hypothesis.get("cost") or "n/a"
         tools = ", ".join(self._extract_tools(hypothesis)) or "none"
         return (
-            "🧠 CEREBELLUM Approval Required\n\n"
+            "CEREBELLUM Approval Required\n\n"
             f"ID: {hypothesis_id}\n"
             f"Summary: {summary}\n"
             f"Confidence: {confidence}\n"
@@ -881,11 +1119,30 @@ class BasalGanglia:
                     try:
                         method(hypothesis_id, state, payload)
                         return
-                    except TypeError:
-                        method(hypothesis_id, state)
-                        return
+                    except TypeError as exc:
+                        logger.debug(
+                            "Cortex state update via %s(hypothesis_id, state, payload) failed; trying fallback signature: %s",
+                            method_name,
+                            exc,
+                        )
+                        try:
+                            method(hypothesis_id, state)
+                            return
+                        except TypeError as fallback_exc:
+                            logger.debug(
+                                "Cortex state update via %s(hypothesis_id, state) failed after fallback attempt: %s",
+                                method_name,
+                                fallback_exc,
+                            )
+                        except Exception:
+                            logger.exception("Cortex state update failed via %s(hypothesis_id, state)", method_name)
                     except Exception:
                         logger.exception("Cortex state update failed via %s", method_name)
+            logger.warning(
+                "No compatible cortex state update signature succeeded for %s; falling back to local persistence",
+                hypothesis_id,
+            )
+            logger.warning("Falling back to local hypothesis state persistence for %s", hypothesis_id)
 
         state_data = self._load_json(self.state_dir / "hypothesis_states.json", default={})
         state_data[hypothesis_id] = {
@@ -931,12 +1188,23 @@ class BasalGanglia:
     def _load_state(self) -> None:
         state = self._load_json(self.state_file, default={})
         self.kill_switch = bool(state.get("kill_switch", self.kill_switch))
-        self.recent_decisions = state.get("recent_decisions", [])[-50:]
+        decisions: list[ActionDecision] = []
+        for item in state.get("recent_decisions", [])[-RECENT_DECISIONS_MAX:]:
+            if not isinstance(item, dict):
+                continue
+            try:
+                decisions.append(ActionDecision(**item))
+            except TypeError:
+                logger.debug("Skipping malformed persisted decision record: %s", item)
+        self.recent_decisions = decisions
 
     def _persist_state(self) -> None:
         self._save_json(
             self.state_file,
-            {"kill_switch": self.kill_switch, "recent_decisions": self.recent_decisions[-50:]},
+            {
+                "kill_switch": self.kill_switch,
+                "recent_decisions": [decision.to_dict() for decision in self.recent_decisions[-RECENT_DECISIONS_MAX:]],
+            },
         )
 
     def _load_json(self, path: Path, default: Any) -> Any:
@@ -964,7 +1232,8 @@ class BasalGanglia:
                     if tmp_path.exists():
                         tmp_path.unlink()
                 except Exception:
-                    pass
+                    # Best-effort cleanup only; do not mask the original JSON write failure.
+                    logger.debug("Ignoring temporary JSON cleanup failure for %s", tmp_path, exc_info=True)
                 raise
 
     def _append_jsonl(self, path: Path, payload: dict[str, Any]) -> None:

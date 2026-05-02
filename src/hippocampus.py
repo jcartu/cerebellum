@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import atexit
 import hashlib
 import json
 import logging
@@ -12,23 +13,17 @@ from collections import Counter
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
-import kuzu
 from typing import Any
 
+import kuzu
 
-logger = logging.getLogger("cerebellum.hippocampus")
-
-
-class _NoRedirectHandler(urllib.request.HTTPErrorProcessor):
-    def http_response(self, request: urllib.request.Request, response: Any) -> Any:
-        if response.status in (301, 302, 303, 307, 308):
-            raise urllib.error.HTTPError(response.url, response.status, "Redirect forbidden", response.headers, None)
-        return response
-
-    https_response = http_response
+try:
+    from .http_safe import _safe_opener
+except ImportError:
+    from http_safe import _safe_opener
 
 
-_safe_opener = urllib.request.build_opener(_NoRedirectHandler())
+logger = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -86,8 +81,13 @@ class Hippocampus:
         self._thread_local = threading.local()
         self._schema_lock = threading.RLock()
         self._write_lock = threading.RLock()
+        self._connection_lock = threading.RLock()
+        self._tracked_connections: list[kuzu.Connection] = []
+        self._closed = False
 
         self._ensure_schema()
+        self._readonly_db = kuzu.Database(str(self.db_path), read_only=True)
+        atexit.register(self.close)
 
     def add_event(self, event: dict[str, Any]) -> None:
         normalized = self._normalize_event(event)
@@ -275,7 +275,7 @@ class Hippocampus:
         discovered: list[dict[str, Any]] = []
 
         try:
-            rows = self._fetch_all(
+            rows = self._fetch_all_read_only(
                 """
                 MATCH (event:Event)
                 WHERE event.timestamp >= $since
@@ -318,13 +318,16 @@ class Hippocampus:
         for index, current in enumerate(parsed_rows):
             source_type = str(current["type"])
             source_counts[source_type] += 1
-            for follower in parsed_rows[index + 1 :]:
+            for follower in parsed_rows[index + 1 : index + 51]:
                 delta = follower["dt"] - current["dt"]
                 if delta <= timedelta(0):
                     continue
                 if delta > one_hour:
                     break
-                support_counts[(source_type, str(follower["type"]))] += 1
+                follower_type = str(follower["type"])
+                if self._event_types_change_significantly(source_type, follower_type):
+                    break
+                support_counts[(source_type, follower_type)] += 1
 
         for (source_type, target_type), support in support_counts.items():
             if support < 5:
@@ -332,7 +335,7 @@ class Hippocampus:
 
             confidence = round(support / max(source_counts[source_type], 1), 4)
             edge_id = f"causal:{hashlib.sha1(f'{source_type}->{target_type}'.encode('utf-8')).hexdigest()[:16]}"
-            timestamp = datetime.now(UTC).isoformat()
+            timestamp = datetime.now(timezone.utc).isoformat()
 
             try:
                 with self._write_lock:
@@ -399,7 +402,10 @@ class Hippocampus:
             return fallback
 
         try:
-            rows = self._fetch_all(llm_query)
+            if not self._is_safe_read_query(llm_query):
+                logger.warning("Rejected unsafe generated query before execution: %s", llm_query)
+                return fallback
+            rows = self._fetch_all_read_only(llm_query)
             return {"ok": True, "mode": "llm", "query": llm_query, "rows": rows}
         except Exception as exc:
             logger.warning("Generated query failed; falling back to heuristics: %s", exc)
@@ -408,7 +414,7 @@ class Hippocampus:
 
     def get_recent_episodes(self, limit: int = 10) -> list[dict[str, Any]]:
         try:
-            episodes = self._fetch_all(
+            episodes = self._fetch_all_read_only(
                 """
                 MATCH (episode:Episode)
                 RETURN episode.id AS id,
@@ -428,7 +434,7 @@ class Hippocampus:
 
         for episode in episodes:
             try:
-                episode["entities"] = self._fetch_all(
+                episode["entities"] = self._fetch_all_read_only(
                     """
                     MATCH (episode:Episode {id: $episode_id})-[:CONTAINS]->(entity:Entity)
                     RETURN entity.id AS id,
@@ -515,7 +521,21 @@ class Hippocampus:
         if connection is None or getattr(connection, "is_closed", False):
             connection = kuzu.Connection(self._db)
             self._thread_local.connection = connection
+            self._track_connection(connection)
         return connection
+
+    def _get_read_connection(self) -> kuzu.Connection:
+        connection = getattr(self._thread_local, "read_connection", None)
+        if connection is None or getattr(connection, "is_closed", False):
+            connection = kuzu.Connection(self._readonly_db)
+            self._thread_local.read_connection = connection
+            self._track_connection(connection)
+        return connection
+
+    def _track_connection(self, connection: kuzu.Connection) -> None:
+        with self._connection_lock:
+            if all(existing is not connection for existing in self._tracked_connections):
+                self._tracked_connections.append(connection)
 
     def _execute(self, query: str, parameters: dict[str, Any] | None = None) -> kuzu.QueryResult:
         conn = self._get_connection()
@@ -530,6 +550,8 @@ class Hippocampus:
         result = self._execute(query, parameters)
         try:
             columns = result.get_column_names()
+            if columns is None:
+                return []
             rows: list[dict[str, Any]] = []
             while result.has_next():
                 values = result.get_next()
@@ -537,6 +559,31 @@ class Hippocampus:
             return rows
         finally:
             result.close()
+
+    def _fetch_all_read_only(self, query: str, parameters: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+        cleaned_query = self._strip_query_comments(query).strip()
+        if not self._is_safe_read_query(cleaned_query):
+            raise ValueError("Refusing to execute non-read-only query")
+        conn = self._get_read_connection()
+        transaction_open = False
+        try:
+            begin_result = conn.execute("BEGIN TRANSACTION")
+            begin_result.close()
+            transaction_open = True
+            result = conn.execute(cleaned_query, parameters or {})
+            try:
+                columns = result.get_column_names()
+                rows: list[dict[str, Any]] = []
+                while result.has_next():
+                    values = result.get_next()
+                    rows.append(dict(zip(columns, values, strict=False)))
+                return rows
+            finally:
+                result.close()
+        finally:
+            if transaction_open:
+                rollback_result = conn.execute("ROLLBACK")
+                rollback_result.close()
 
     def _upsert_entity(self, entity: dict[str, str], timestamp: str) -> None:
         self._run(
@@ -566,7 +613,7 @@ class Hippocampus:
         elif not isinstance(payload, dict):
             payload = {"raw": payload}
 
-        timestamp = str(event.get("timestamp") or datetime.now(UTC).isoformat())
+        timestamp = str(event.get("timestamp") or datetime.now(timezone.utc).isoformat())
         self._parse_timestamp(timestamp)
 
         normalized = {
@@ -600,7 +647,7 @@ class Hippocampus:
                 return {"ok": True, "mode": "heuristic", "query": "recent_episodes", "rows": self.get_recent_episodes()}
 
             if any(token in lowered for token in ("causal", "cause", "causes", "pattern")):
-                rows = self._fetch_all(
+                rows = self._fetch_all_read_only(
                     """
                     MATCH (edge:CausalEdge)
                     RETURN edge.id AS id,
@@ -618,7 +665,7 @@ class Hippocampus:
             event_match = re.search(r"(?:event type|events about|events for)\s+([\w.:-]+)", lowered)
             if event_match:
                 event_type = event_match.group(1)
-                rows = self._fetch_all(
+                rows = self._fetch_all_read_only(
                     """
                     MATCH (event:Event)
                     WHERE lower(event.type) = lower($event_type)
@@ -634,7 +681,7 @@ class Hippocampus:
                 )
                 return {"ok": True, "mode": "heuristic", "query": "events_by_type", "rows": rows}
 
-            rows = self._fetch_all(
+            rows = self._fetch_all_read_only(
                 """
                 MATCH (event:Event)
                 RETURN event.id AS id,
@@ -681,6 +728,13 @@ User request: {natural_language}
         except Exception as exc:
             logger.warning("Failed to generate NL query via LLM: %s", exc)
             return None
+
+    def _event_types_change_significantly(self, source_type: str, follower_type: str) -> bool:
+        source_tokens = {token for token in re.split(r"[^a-z0-9]+", source_type.lower()) if token}
+        follower_tokens = {token for token in re.split(r"[^a-z0-9]+", follower_type.lower()) if token}
+        if not source_tokens or not follower_tokens:
+            return False
+        return source_tokens.isdisjoint(follower_tokens)
 
     def _call_llm(self, prompt: str) -> LLMResponse:
         if not self.openrouter_api_key:
@@ -780,16 +834,41 @@ User request: {natural_language}
         return parsed.astimezone(UTC)
 
     def close(self) -> None:
-        db = getattr(self, "_db", None)
-        if db is None:
-            return
+        with self._connection_lock:
+            if self._closed:
+                return
+            self._closed = True
+            tracked_connections = list(self._tracked_connections)
+            self._tracked_connections.clear()
 
-        close = getattr(db, "close", None)
-        if not callable(close):
-            logger.debug("KuzuDB connection does not expose close(); skipping shutdown")
-            return
+        for attribute_name in ("read_connection", "connection"):
+            thread_connection = getattr(self._thread_local, attribute_name, None)
+            if thread_connection is not None and all(existing is not thread_connection for existing in tracked_connections):
+                tracked_connections.append(thread_connection)
 
-        try:
-            close()
-        except Exception as exc:
-            logger.error("Failed to close KuzuDB connection: %s", exc)
+        for index, connection in enumerate(tracked_connections):
+            close = getattr(connection, "close", None)
+            if not callable(close):
+                logger.debug("Kuzu connection %d does not expose close(); skipping shutdown", index)
+                continue
+
+            try:
+                close()
+            except Exception as exc:
+                # Connection cleanup is best-effort during shutdown; keep going so every handle gets a chance to close.
+                logger.debug("Failed to close Kuzu thread connection %d cleanly: %s", index, exc)
+
+        for db_name in ("_readonly_db", "_db"):
+            db = getattr(self, db_name, None)
+            if db is None:
+                continue
+
+            close = getattr(db, "close", None)
+            if not callable(close):
+                logger.debug("KuzuDB %s does not expose close(); skipping shutdown", db_name)
+                continue
+
+            try:
+                close()
+            except Exception as exc:
+                logger.error("Failed to close KuzuDB handle %s: %s", db_name, exc)

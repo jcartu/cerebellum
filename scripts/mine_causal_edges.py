@@ -14,7 +14,7 @@ if str(SRC_DIR) not in sys.path:
 from hippocampus import Hippocampus  # noqa: E402
 
 
-logger = logging.getLogger("cerebellum.mine_causal_edges")
+logger = logging.getLogger(__name__)
 
 
 def main() -> int:

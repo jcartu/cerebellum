@@ -23,6 +23,11 @@ from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 import uvicorn
 
 try:
+    from ..http_safe import _safe_opener
+except ImportError:
+    from http_safe import _safe_opener
+
+try:
     from ..events import CerebellumEventEmitter
 except ImportError:
     import sys
@@ -38,20 +43,22 @@ except ImportError:
     _sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     from src.arbiter import BasalGanglia  # type: ignore[no-redef]
 
-logger = logging.getLogger("cerebellum.dashboard")
-CONFIG_PATH = Path("/home/josh/.openclaw/cerebellum/config.json")
+logger = logging.getLogger(__name__)
 
 
-class _NoRedirectHandler(urllib.request.HTTPErrorProcessor):
-    def http_response(self, request: urllib.request.Request, response: Any) -> Any:
-        if response.status in (301, 302, 303, 307, 308):
-            raise urllib.error.HTTPError(response.url, response.status, "Redirect forbidden", response.headers, None)
-        return response
-
-    https_response = http_response
+def _base_dir() -> Path:
+    return Path(os.environ.get("CEREBELLUM_BASE_DIR", "/home/josh/.openclaw/cerebellum")).expanduser()
 
 
-_safe_opener = urllib.request.build_opener(_NoRedirectHandler())
+def _config_path() -> Path:
+    configured = os.environ.get("CEREBELLUM_CONFIG")
+    if configured:
+        return Path(configured).expanduser()
+    return _base_dir() / "config.json"
+
+
+CONFIG_PATH = _config_path()
+
 
 # Lazy singleton — avoids module-level side effects
 _emitter: CerebellumEventEmitter | None = None
@@ -72,7 +79,7 @@ def get_emitter() -> CerebellumEventEmitter:
 def get_arbiter() -> BasalGanglia | None:
     global _arbiter
     if _arbiter is None:
-        policy_path = CONFIG_PATH.parent / "policy.yaml"
+        policy_path = _base_dir() / "policy.yaml"
         if not policy_path.exists():
             return None
         try:
@@ -90,11 +97,18 @@ if not DASHBOARD_TOKEN:
     sys.exit(1)
 _dashboard_db: sqlite3.Connection | None = None
 _dashboard_db_lock = threading.RLock()
+_auth_rate_lock = threading.RLock()
+_auth_rate_windows: dict[str, tuple[int, int]] = {}
+_telegram_webhook_rate_lock = threading.RLock()
+_telegram_webhook_rate_windows: dict[str, tuple[int, int]] = {}
 
 
 def _dashboard_db_path() -> Path:
-    config = json.loads(CONFIG_PATH.read_text())
-    return Path(config["sqlite"]["events_db"]).expanduser()
+    config = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    db_path = Path(config["sqlite"]["events_db"]).expanduser()
+    if not db_path.is_absolute():
+        db_path = _base_dir() / db_path
+    return db_path
 
 
 def _get_dashboard_db() -> sqlite3.Connection:
@@ -104,20 +118,48 @@ def _get_dashboard_db() -> sqlite3.Connection:
             db_path = _dashboard_db_path()
             db_path.parent.mkdir(parents=True, exist_ok=True)
             _dashboard_db = sqlite3.connect(db_path, check_same_thread=False)
-            _dashboard_db.execute(
-                """
-                CREATE TABLE IF NOT EXISTS telegram_seen_updates (
-                    update_id INTEGER PRIMARY KEY,
-                    seen_at INTEGER NOT NULL
-                )
-                """
-            )
+            _ensure_telegram_seen_updates_schema(_dashboard_db)
             _dashboard_db.commit()
         return _dashboard_db
 
 
+def _ensure_telegram_seen_updates_schema(db: sqlite3.Connection) -> None:
+    schema_rows = db.execute("PRAGMA table_info(telegram_seen_updates)").fetchall()
+    needs_rebuild = False
+    if schema_rows:
+        update_id_row = next((row for row in schema_rows if row[1] == "update_id"), None)
+        update_id_type = str(update_id_row[2]).upper() if update_id_row else ""
+        needs_rebuild = update_id_type != "TEXT"
+    if needs_rebuild:
+        db.execute("ALTER TABLE telegram_seen_updates RENAME TO telegram_seen_updates_legacy")
+    db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS telegram_seen_updates (
+            update_id TEXT PRIMARY KEY,
+            seen_at INTEGER NOT NULL
+        )
+        """
+    )
+    db.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_telegram_seen_updates_update_id ON telegram_seen_updates(update_id)"
+    )
+    if needs_rebuild:
+        db.execute(
+            """
+            INSERT OR IGNORE INTO telegram_seen_updates (update_id, seen_at)
+            SELECT CAST(update_id AS TEXT), seen_at
+            FROM telegram_seen_updates_legacy
+            WHERE update_id IS NOT NULL
+            """
+        )
+        db.execute("DROP TABLE telegram_seen_updates_legacy")
+
+
 @app.on_event("startup")
 async def _startup_init_dashboard_db() -> None:
+    if TELEGRAM_WEBHOOK_SECRET and len(TELEGRAM_WEBHOOK_SECRET.encode("utf-8")) < 32:
+        logger.error("TELEGRAM_WEBHOOK_SECRET must be at least 32 bytes")
+        raise RuntimeError("Dashboard cannot start: weak Telegram webhook secret")
     _get_dashboard_db()
 
 
@@ -129,6 +171,9 @@ async def auth_middleware(request: Request, call_next: Any) -> Any:
         auth = request.headers.get("Authorization", "")
         if not hmac.compare_digest(auth, f"Bearer {DASHBOARD_TOKEN}"):
             return JSONResponse(status_code=401, content={"error": "unauthorized"})
+        source_ip = _request_source_ip(request)
+        if not _allow_authenticated_request(source_ip):
+            return JSONResponse(status_code=429, content={"error": "rate_limit_exceeded"})
     return await call_next(request)
 
 
@@ -151,6 +196,52 @@ def _parse_since(raw_since: str | None) -> datetime | None:
         return datetime.fromisoformat(raw_since).astimezone(timezone.utc)
     except ValueError:
         return None
+
+
+def _request_source_ip(request: Request) -> str:
+    forwarded_for = request.headers.get("X-Forwarded-For", "").strip()
+    if forwarded_for:
+        return forwarded_for.split(",")[0].strip()
+    client = request.client
+    return client.host if client and client.host else "unknown"
+
+
+def _allow_telegram_webhook_ip(source_ip: str) -> bool:
+    now_window = int(time.time() // 60)
+    with _telegram_webhook_rate_lock:
+        window_start, count = _telegram_webhook_rate_windows.get(source_ip, (now_window, 0))
+        if window_start != now_window:
+            window_start, count = now_window, 0
+        if count >= 60:
+            _telegram_webhook_rate_windows[source_ip] = (window_start, count)
+            stale_windows = [ip for ip, (window, _) in _telegram_webhook_rate_windows.items() if window != now_window]
+            for stale_ip in stale_windows:
+                _telegram_webhook_rate_windows.pop(stale_ip, None)
+            return False
+        _telegram_webhook_rate_windows[source_ip] = (window_start, count + 1)
+        stale_windows = [ip for ip, (window, _) in _telegram_webhook_rate_windows.items() if window != now_window]
+        for stale_ip in stale_windows:
+            _telegram_webhook_rate_windows.pop(stale_ip, None)
+        return True
+
+
+def _allow_authenticated_request(source_ip: str) -> bool:
+    now_window = int(time.time() // 60)
+    with _auth_rate_lock:
+        window_start, count = _auth_rate_windows.get(source_ip, (now_window, 0))
+        if window_start != now_window:
+            window_start, count = now_window, 0
+        if count >= 60:
+            _auth_rate_windows[source_ip] = (window_start, count)
+            stale_windows = [ip for ip, (window, _) in _auth_rate_windows.items() if window != now_window]
+            for stale_ip in stale_windows:
+                _auth_rate_windows.pop(stale_ip, None)
+            return False
+        _auth_rate_windows[source_ip] = (window_start, count + 1)
+        stale_windows = [ip for ip, (window, _) in _auth_rate_windows.items() if window != now_window]
+        for stale_ip in stale_windows:
+            _auth_rate_windows.pop(stale_ip, None)
+        return True
 
 
 def _render_events(events: list[dict[str, Any]]) -> str:
@@ -256,18 +347,28 @@ async def api_events_stream(request: Request) -> StreamingResponse:
 
     async def event_generator() -> Any:
         last_seen = datetime.now(timezone.utc) - timedelta(seconds=5)
-        while True:
-            if await request.is_disconnected():
-                break
-            try:
-                for event in reversed(emitter.query(since=last_seen, limit=100)):
-                    event_time = datetime.fromisoformat(event["timestamp"]).astimezone(timezone.utc)
-                    if event_time > last_seen:
-                        last_seen = event_time
-                    yield f"data: {json.dumps(event, default=str)}\n\n"
-            except Exception:
-                logger.exception("SSE generator failed")
-            await asyncio.sleep(2)
+        try:
+            while True:
+                if await request.is_disconnected():
+                    break
+                try:
+                    for event in reversed(emitter.query(since=last_seen, limit=100)):
+                        if await request.is_disconnected():
+                            break
+                        event_time = datetime.fromisoformat(event["timestamp"]).astimezone(timezone.utc)
+                        if event_time > last_seen:
+                            last_seen = event_time
+                        yield f"data: {json.dumps(event, default=str)}\n\n"
+                        if await request.is_disconnected():
+                            break
+                except Exception:
+                    logger.exception("SSE generator failed")
+                if await request.is_disconnected():
+                    break
+                await asyncio.sleep(2)
+        finally:
+            # Log explicit cleanup so disconnected SSE clients do not silently leak generators.
+            logger.debug("Closing dashboard SSE generator after client disconnect")
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
@@ -323,12 +424,19 @@ async def telegram_webhook(request: Request) -> JSONResponse:
         logger.error("TELEGRAM_WEBHOOK_SECRET not set; refusing webhook")
         raise HTTPException(status_code=503, detail="Webhook secret not configured")
 
+    source_ip = _request_source_ip(request)
+    logger.info("Telegram webhook request from %s", source_ip)
+
+    if not _allow_telegram_webhook_ip(source_ip):
+        logger.warning("Rejected Telegram webhook from %s: rate limit exceeded", source_ip)
+        raise HTTPException(status_code=429, detail="Rate limit exceeded")
+
     provided_secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
     if not hmac.compare_digest(
         provided_secret.encode("utf-8"),
         TELEGRAM_WEBHOOK_SECRET.encode("utf-8"),
     ):
-        logger.warning("Rejected Telegram webhook: bad secret token")
+        logger.warning("Rejected Telegram webhook from %s: bad secret token", source_ip)
         raise HTTPException(status_code=401, detail="Invalid webhook secret")
 
     if not TELEGRAM_ALLOWED_USER_IDS:
@@ -338,16 +446,15 @@ async def telegram_webhook(request: Request) -> JSONResponse:
     try:
         update = await request.json()
     except Exception:
+        # Invalid JSON is expected from untrusted webhook callers; keep this low-noise while preserving traceability.
+        logger.debug("Rejected Telegram webhook with invalid JSON body", exc_info=True)
         raise HTTPException(status_code=400, detail="Invalid JSON body")
 
     now_ts = int(time.time())
     update_id_raw = update.get("update_id", update.get("id"))
-    try:
-        update_id = int(update_id_raw) if update_id_raw is not None else None
-    except (TypeError, ValueError):
-        update_id = None
+    update_id = str(update_id_raw).strip() if update_id_raw is not None else ""
 
-    if update_id is not None:
+    if update_id:
         with _dashboard_db_lock:
             db = _get_dashboard_db()
             cursor = db.cursor()
@@ -466,7 +573,7 @@ def _send_telegram_text(chat_id: str | int, text: str) -> None:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    config = json.loads(CONFIG_PATH.read_text())
+    config = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
     port = config.get("dashboard", {}).get("port", 18790)
     host = os.environ.get("CEREBELLUM_DASHBOARD_HOST", "127.0.0.1")
     uvicorn.run(app, host=host, port=port, reload=False)

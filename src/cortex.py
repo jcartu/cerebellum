@@ -1,7 +1,10 @@
+"""Hypothesis generation and lifecycle management for CEREBELLUM."""
+
 import json
 import logging
 import os
 import sqlite3
+import threading
 import time
 import uuid
 from dataclasses import asdict, dataclass
@@ -14,7 +17,14 @@ try:
 except ImportError:  # pragma: no cover - handled gracefully at runtime
     OpenAI = None  # type: ignore[assignment]
 
-logger = logging.getLogger("cerebellum.cortex")
+logger = logging.getLogger(__name__)
+
+EMPTY_USAGE: dict[str, Any] = {
+    "prompt_tokens": 0,
+    "completion_tokens": 0,
+    "total_tokens": 0,
+    "model": "",
+}
 
 
 @dataclass
@@ -41,8 +51,30 @@ class PrefrontalCortex:
     """Hypothesis generation engine."""
 
     DEFAULT_MODELS = ["openai/gpt-4o", "anthropic/claude-opus-4.7"]
-    VALID_STATES = {"proposed", "staged", "executed", "rejected", "expired"}
+    VALID_STATES = {
+        "proposed",
+        "staged",
+        "pending_approval",
+        "snoozed",
+        "executed",
+        "completed",
+        "rejected",
+        "expired",
+    }
     VALID_REVERSIBILITY = {"full", "partial", "none"}
+    MAX_LLM_RESPONSE_BYTES = 8 * 1024 * 1024
+    EXPECTED_HYPOTHESIS_KEYS = {
+        "title",
+        "description",
+        "confidence",
+        "utility",
+        "cost",
+        "reversibility",
+        "plan",
+        "tools_required",
+        "context_summary",
+        "metadata",
+    }
 
     def __init__(self, config_path: str, emitter=None, hippocampus=None):
         self.config_path = Path(config_path).expanduser()
@@ -59,6 +91,11 @@ class PrefrontalCortex:
         self.generation_interval_minutes = int(self.config.get("generation_interval_minutes", 5))
         self.app_name = self.config.get("app_name", "CEREBELLUM")
         self.site_url = self.config.get("site_url")
+        self._db_lock = threading.RLock()
+        self._sqlite: sqlite3.Connection | None = None
+        self._checkpoint_interval_seconds = 300
+        self._checkpoint_stop = threading.Event()
+        self._checkpoint_thread: threading.Thread | None = None
         self._client = self._build_client()
         self._init_db()
 
@@ -83,20 +120,30 @@ class PrefrontalCortex:
             headers = {"HTTP-Referer": self.site_url or "https://localhost/cerebellum", "X-Title": self.app_name}
             return OpenAI(api_key=self.api_key, base_url=self.openrouter_base_url, default_headers=headers)
         except Exception as exc:
-            logger.error("Failed to initialize OpenRouter client: %s", exc)
+            logger.error("Failed to initialize OpenRouter client: %s", self._redact_openrouter_error(exc))
             return None
 
+    def _redact_openrouter_error(self, exc: Exception) -> str:
+        message = str(exc)
+        if not self.api_key:
+            return message
+        return message.replace(self.api_key, "sk-or-v1-***")
+
     def _get_connection(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=NORMAL")
-        return conn
+        if self._sqlite is None:
+            raise RuntimeError("Hypotheses database is not initialized")
+        return self._sqlite
 
     def _init_db(self):
         try:
             self.base_dir.mkdir(parents=True, exist_ok=True)
-            with self._get_connection() as conn:
+            with self._db_lock:
+                self._sqlite = sqlite3.connect(self.db_path, check_same_thread=False)
+                self._sqlite.row_factory = sqlite3.Row
+                self._sqlite.execute("PRAGMA journal_mode=WAL")
+                self._sqlite.execute("PRAGMA synchronous=NORMAL")
+                self._sqlite.execute("PRAGMA wal_autocheckpoint=1000")
+                conn = self._get_connection()
                 conn.execute(
                     """
                     CREATE TABLE IF NOT EXISTS hypotheses (
@@ -125,6 +172,7 @@ class PrefrontalCortex:
                     "CREATE INDEX IF NOT EXISTS idx_hypotheses_created_at ON hypotheses(created_at DESC)"
                 )
                 conn.commit()
+            self._start_checkpoint_worker()
         except Exception as exc:
             logger.error("Failed to initialize hypotheses DB at %s: %s", self.db_path, exc)
 
@@ -207,10 +255,10 @@ class PrefrontalCortex:
             logger.error("Failed to build hypothesis prompt: %s", exc)
             return "Return an empty JSON array: []"
 
-    def _call_llm(self, prompt: str) -> tuple[list[dict], dict[str, int]]:
+    def _call_llm(self, prompt: str) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         """Call OpenRouter API for hypothesis generation."""
         if self._client is None:
-            return [], {}
+            return [], dict(EMPTY_USAGE)
 
         for model in self.model_candidates:
             for attempt in range(3):
@@ -228,11 +276,18 @@ class PrefrontalCortex:
                     )
                     usage = self._extract_usage(response, model=model)
                     content = self._clean_json_content(self._extract_message_content(response))
-                    parsed = json.loads(content)
-                    hypotheses = parsed.get("hypotheses") if isinstance(parsed, dict) else parsed
-                    if isinstance(hypotheses, list):
-                        return [item for item in hypotheses if isinstance(item, dict)], usage
-                    logger.error("LLM returned non-list payload for model %s", model)
+                    content_size = len(content.encode("utf-8"))
+                    if content_size > self.MAX_LLM_RESPONSE_BYTES:
+                        logger.error(
+                            "Rejecting oversized LLM response for model %s: %d bytes exceeds %d",
+                            model,
+                            content_size,
+                            self.MAX_LLM_RESPONSE_BYTES,
+                        )
+                        return [], usage
+                    hypotheses = self._parse_hypothesis_response(content, model=model)
+                    if hypotheses is not None:
+                        return hypotheses, usage
                     return [], usage
                 except Exception as exc:
                     if attempt >= 2:
@@ -247,13 +302,26 @@ class PrefrontalCortex:
                         delay,
                     )
                     time.sleep(delay)
-        return [], {}
+        return [], dict(EMPTY_USAGE)
 
     def _extract_usage(self, response: Any, model: str | None = None) -> dict[str, Any]:
+        usage_payload = dict(EMPTY_USAGE)
         usage = getattr(response, "usage", None)
-        prompt_tokens = int(getattr(usage, "prompt_tokens", 0) or 0)
-        completion_tokens = int(getattr(usage, "completion_tokens", 0) or 0)
-        total_tokens = int(getattr(usage, "total_tokens", 0) or (prompt_tokens + completion_tokens))
+        try:
+            prompt_tokens = max(0, int(getattr(usage, "prompt_tokens", 0) or 0))
+            completion_tokens = max(0, int(getattr(usage, "completion_tokens", 0) or 0))
+            total_tokens = max(
+                0,
+                int(getattr(usage, "total_tokens", 0) or (prompt_tokens + completion_tokens)),
+            )
+        except (TypeError, ValueError) as exc:
+            logger.error("Rejecting malformed LLM usage payload for model %s: %s", model or "", exc)
+            return {
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "total_tokens": 0,
+                "model": str(getattr(response, "model", None) or model or ""),
+            }
         actual_model = str(getattr(response, "model", None) or model or "")
         logger.info(
             "LLM usage: model=%s prompt=%s completion=%s total=%s",
@@ -262,12 +330,63 @@ class PrefrontalCortex:
             completion_tokens,
             total_tokens,
         )
-        return {
-            "prompt_tokens": prompt_tokens,
-            "completion_tokens": completion_tokens,
-            "total_tokens": total_tokens,
-            "model": actual_model,
-        }
+        usage_payload.update(
+            {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": total_tokens,
+                "model": actual_model,
+            }
+        )
+        return usage_payload
+
+    def _parse_hypothesis_response(self, content: str, model: str) -> list[dict[str, Any]] | None:
+        try:
+            parsed = json.loads(content)
+        except json.JSONDecodeError as exc:
+            logger.error("Rejecting malformed JSON from model %s: %s", model, exc)
+            return None
+
+        hypotheses: Any
+        if isinstance(parsed, list):
+            hypotheses = parsed
+        elif isinstance(parsed, dict):
+            hypotheses = parsed.get("hypotheses")
+            if hypotheses is None:
+                logger.error("Rejecting malformed JSON from model %s: missing 'hypotheses' key", model)
+                return None
+        else:
+            logger.error("Rejecting malformed JSON from model %s: top-level payload must be a list or object", model)
+            return None
+
+        if not isinstance(hypotheses, list):
+            logger.error("Rejecting malformed JSON from model %s: hypotheses payload must be a list", model)
+            return None
+
+        valid_hypotheses: list[dict[str, Any]] = []
+        for item in hypotheses:
+            if not isinstance(item, dict):
+                logger.error("Rejecting non-object hypothesis from model %s: %r", model, item)
+                return None
+            missing_keys = self.EXPECTED_HYPOTHESIS_KEYS.difference(item)
+            if missing_keys:
+                logger.error(
+                    "Rejecting malformed hypothesis from model %s; missing keys: %s",
+                    model,
+                    sorted(missing_keys),
+                )
+                return None
+            if not isinstance(item.get("plan"), list):
+                logger.error("Rejecting malformed hypothesis from model %s: plan must be a list", model)
+                return None
+            if not isinstance(item.get("tools_required"), list):
+                logger.error("Rejecting malformed hypothesis from model %s: tools_required must be a list", model)
+                return None
+            if not isinstance(item.get("metadata"), dict):
+                logger.error("Rejecting malformed hypothesis from model %s: metadata must be an object", model)
+                return None
+            valid_hypotheses.append(item)
+        return valid_hypotheses
 
     def _extract_message_content(self, response: Any) -> str:
         try:
@@ -306,6 +425,24 @@ class PrefrontalCortex:
             stripped = "\n".join(lines).strip()
         return stripped
 
+    def _start_checkpoint_worker(self) -> None:
+        if self._checkpoint_thread is not None and self._checkpoint_thread.is_alive():
+            return
+        self._checkpoint_thread = threading.Thread(
+            target=self._checkpoint_worker,
+            name="cerebellum-cortex-wal-checkpoint",
+            daemon=True,
+        )
+        self._checkpoint_thread.start()
+
+    def _checkpoint_worker(self) -> None:
+        while not self._checkpoint_stop.wait(self._checkpoint_interval_seconds):
+            try:
+                with self._db_lock:
+                    self._get_connection().execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            except Exception as exc:
+                logger.warning("Cortex WAL checkpoint failed: %s", exc)
+
     def get_active_hypotheses(self, state: Optional[str] = None, limit: int = 50) -> list[dict]:
         """Query hypotheses by state."""
         try:
@@ -316,7 +453,8 @@ class PrefrontalCortex:
                 params.append(state)
             sql += " ORDER BY timestamp DESC, created_at DESC LIMIT ?"
             params.append(max(1, limit))
-            with self._get_connection() as conn:
+            with self._db_lock:
+                conn = self._get_connection()
                 rows = conn.execute(sql, params).fetchall()
             return [self._row_to_dict(row) for row in rows]
         except Exception as exc:
@@ -325,7 +463,8 @@ class PrefrontalCortex:
 
     def get_hypothesis(self, hypothesis_id: str) -> Optional[dict[str, Any]]:
         try:
-            with self._get_connection() as conn:
+            with self._db_lock:
+                conn = self._get_connection()
                 row = conn.execute("SELECT * FROM hypotheses WHERE id = ?", (hypothesis_id,)).fetchone()
             return self._row_to_dict(row) if row else None
         except Exception as exc:
@@ -351,7 +490,8 @@ class PrefrontalCortex:
                 }
             )
             metadata["state_transitions"] = transitions
-            with self._get_connection() as conn:
+            with self._db_lock:
+                conn = self._get_connection()
                 conn.execute(
                     """
                     UPDATE hypotheses
@@ -375,7 +515,8 @@ class PrefrontalCortex:
         try:
             cutoff = (datetime.now(timezone.utc) - timedelta(hours=max_age_hours)).isoformat()
             expired_ids: list[str] = []
-            with self._get_connection() as conn:
+            with self._db_lock:
+                conn = self._get_connection()
                 rows = conn.execute(
                     "SELECT id FROM hypotheses WHERE state = 'proposed' AND timestamp < ?",
                     (cutoff,),
@@ -404,7 +545,8 @@ class PrefrontalCortex:
     def get_hypothesis_stats(self) -> dict:
         """Return counts by state, avg confidence, etc."""
         try:
-            with self._get_connection() as conn:
+            with self._db_lock:
+                conn = self._get_connection()
                 counts = {
                     row["state"]: row["count"]
                     for row in conn.execute(
@@ -657,7 +799,8 @@ class PrefrontalCortex:
 
     def _store_hypothesis(self, hypothesis: Hypothesis) -> bool:
         try:
-            with self._get_connection() as conn:
+            with self._db_lock:
+                conn = self._get_connection()
                 conn.execute(
                     """
                     INSERT INTO hypotheses (
@@ -698,6 +841,8 @@ class PrefrontalCortex:
         try:
             return json.loads(value) if value else fallback
         except Exception:
+            # Stored metadata may be partially corrupted; log at debug and keep reads resilient with a safe fallback.
+            logger.debug("Falling back for malformed JSON column value", exc_info=True)
             return fallback
 
     def _emit_event(self, event_type: str, payload: dict[str, Any]) -> None:
