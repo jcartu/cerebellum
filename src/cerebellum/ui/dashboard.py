@@ -594,7 +594,7 @@ async def telegram_webhook(request: Request) -> JSONResponse:
     if msg_date and (time.time() - msg_date) > 300:
         return JSONResponse({"ok": True, "message": "callback expired"})
 
-    def _actor_id(obj: dict) -> str:
+    def _actor_id(obj: dict[str, Any]) -> str:
         user = obj.get("from") or {}
         return str(user.get("id") or "")
 

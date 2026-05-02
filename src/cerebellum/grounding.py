@@ -183,7 +183,7 @@ class GroundingVerifier:
                     self.config_path,
                 )
                 return {}
-            return json.loads(self.config_path.read_text(encoding="utf-8"))
+            return json.loads(self.config_path.read_text(encoding="utf-8"))  # type: ignore[no-any-return]
         except Exception as exc:
             logger.error("Failed to load grounding config %s: %s", self.config_path, exc)
             return {}

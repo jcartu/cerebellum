@@ -196,7 +196,7 @@ class EventBus:
 
     def _load_config(self, config_path: Path) -> dict[str, Any]:
         try:
-            return json.loads(config_path.read_text())
+            return json.loads(config_path.read_text())  # type: ignore[no-any-return]
         except FileNotFoundError:
             logger.error("Config file not found: %s", config_path)
             raise

@@ -444,7 +444,7 @@ class EpisodeStore:
     @staticmethod
     def _load_config(config_path: Path) -> dict[str, Any]:
         try:
-            return json.loads(config_path.read_text())
+            return json.loads(config_path.read_text())  # type: ignore[no-any-return]
         except FileNotFoundError:
             logger.warning("Config file %s not found; using defaults", config_path)
             return {}
@@ -539,8 +539,6 @@ class EpisodeStore:
         result = self._execute(query, parameters)
         try:
             columns = result.get_column_names()
-            if columns is None:
-                return []
             rows: list[dict[str, Any]] = []
             while result.has_next():
                 values = result.get_next()
@@ -771,7 +769,7 @@ User request: {natural_language}
     def _extract_json_object(self, text: str) -> dict[str, Any]:
         """Extract a JSON object from a text string."""
         try:
-            return json.loads(text)
+            return json.loads(text)  # type: ignore[no-any-return]
         except json.JSONDecodeError:
             pass
 
@@ -779,7 +777,7 @@ User request: {natural_language}
         end = text.rfind("}")
         if start != -1 and end != -1:
             try:
-                return json.loads(text[start : end + 1])
+                return json.loads(text[start : end + 1])  # type: ignore[no-any-return]
             except json.JSONDecodeError:
                 pass
 
