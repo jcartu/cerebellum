@@ -234,7 +234,7 @@ class Proposer:
                 "current_time": datetime.now(UTC).isoformat(),
             }
             return (
-                "You are the proposer for CEREBELLUM, a shadow cognition layer for RASPUTIN. "
+                "You are the proposer for CEREBELLUM, a proactive ops assistant for RASPUTIN. "
                 "Analyze recent system behavior and propose a small set of high-value hypotheses about useful next actions, risks, or follow-up work.\n\n"
                 "Rules:\n"
                 "1. Return ONLY valid JSON. No markdown, no prose, no code fences.\n"

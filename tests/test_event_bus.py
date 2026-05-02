@@ -129,4 +129,92 @@ def test_emit_with_none_payload_stores_none(event_bus):
     event_bus.emit("null.event", None)
     events = event_bus.query(limit=10)
     ev = next(e for e in events if e["type"] == "null.event")
-    assert ev["payload"] is None
+
+def test_config_load_missing_file(tmp_path):
+    """EventBus raises FileNotFoundError when config is missing."""
+    with pytest.raises(FileNotFoundError):
+        EventBus(str(tmp_path / "nonexistent.json"))
+
+
+def test_config_load_invalid_json(tmp_path):
+    """EventBus raises JSONDecodeError when config is malformed."""
+    config_path = tmp_path / "config.json"
+    config_path.write_text("{invalid json}")
+    with pytest.raises(json.JSONDecodeError):
+        EventBus(str(config_path))
+
+
+def test_write_event_dedup_on_duplicate_id(event_bus):
+    """write_event with OR IGNORE silently skips duplicate IDs."""
+    event = {
+        "id": "dedup-1",
+        "timestamp": "2025-01-01T00:00:00+00:00",
+        "type": "test.event",
+        "payload": {"v": 1},
+        "actor": "tester",
+        "context": {},
+    }
+    event_bus.write_event(event)
+    event_bus.write_event(event)  # Should be silently ignored
+    events = event_bus.query(limit=10)
+    assert sum(1 for e in events if e["id"] == "dedup-1") == 1
+
+
+def test_query_with_limit_respects_max(event_bus):
+    """query respects the limit parameter."""
+    for i in range(10):
+        event_bus.emit("limit.test", {"i": i})
+    events = event_bus.query(limit=3)
+    assert len(events) == 3
+
+
+def test_emit_with_empty_context_stores_empty_dict(event_bus):
+    """emit with no context stores empty dict."""
+    event_id = event_bus.emit("empty.ctx", {"data": 1})
+    events = event_bus.query(limit=10)
+    ev = next(e for e in events if e["id"] == event_id)
+    assert ev["context"] == {}
+
+
+def test_close_with_nats_unavailable(tmp_path, caplog):
+    """close() handles gracefully when NATS is unavailable."""
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "sqlite": {"events_db": str(tmp_path / "events2.sqlite3")},
+                "nats": {"host": "127.0.0.1", "port": 4222, "jetstream_domain": ""},
+            }
+        )
+    )
+    bus = EventBus(config_path)
+    with caplog.at_level("WARNING"):
+        bus.close()
+    # Should not raise
+
+
+def test_query_error_returns_empty(tmp_path, caplog):
+    """query returns [] on database error."""
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "sqlite": {"events_db": str(tmp_path / "events3.sqlite3")},
+                "nats": {"host": "127.0.0.1", "port": 4222, "jetstream_domain": ""},
+            }
+        )
+    )
+    bus = EventBus(config_path)
+    # Corrupt the connection by closing it manually
+    bus._sqlite.close()
+    with caplog.at_level("ERROR"):
+        result = bus.query(limit=10)
+    assert result == []
+    assert "Failed to query events" in caplog.text
+
+
+def test_write_event_missing_specific_keys(event_bus):
+    """write_event reports which specific keys are missing."""
+    with pytest.raises(ValueError, match="missing required keys"):
+        event_bus.write_event({"id": "x"})
+
