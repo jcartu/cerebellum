@@ -172,7 +172,6 @@ For each phase, fill out the section before merging to `main` and tagging `phase
 ---
 
 ## Phase 3 — Real successor-pattern mining
-## Phase 3 — Real successor-pattern mining
 
 - **Started:** 2026-05-03
 - **Completed:** 2026-05-04
