@@ -57,6 +57,12 @@ class EpisodeStore:
         "UPSERT",
     )
 
+    _ALLOWED_CALL_PROCEDURES = frozenset({
+        "db.schema",
+        "db.show_tables",
+        "db.show_connections",
+    })
+
     def __init__(self, config_path: str):
         self.config_path = Path(config_path).expanduser()
         self.config = self._load_config(self.config_path)
@@ -786,12 +792,25 @@ User request: {natural_language}
         if ";" in candidate:
             return False
 
+        # Strip string literals so keywords inside string values don't trigger false positives
+        stripped = re.sub(r"'[^']*'", "''", candidate)
+        stripped = re.sub(r'"[^"]*"', '""', stripped)
+
         for keyword in self._READ_ONLY_BLOCKED_KEYWORDS:
-            if re.search(r"\b" + keyword + r"\b", candidate, re.IGNORECASE):
+            if re.search(r"\b" + keyword + r"\b", stripped, re.IGNORECASE):
                 return False
 
         first_word = candidate.split()[0].upper() if candidate.split() else ""
-        return first_word in self._READ_ONLY_QUERY_PREFIXES
+        if first_word not in self._READ_ONLY_QUERY_PREFIXES:
+            return False
+
+        # CALL whitelist: restrict to known-safe procedures
+        if first_word == "CALL" and len(candidate.split()) >= 2:
+            proc = candidate.split()[1].strip("()")
+            if proc not in self._ALLOWED_CALL_PROCEDURES:
+                return False
+
+        return True
 
     def _strip_query_comments(self, query: str) -> str:
         without_block_comments = re.sub(r"/\*.*?\*/", "", query, flags=re.DOTALL)

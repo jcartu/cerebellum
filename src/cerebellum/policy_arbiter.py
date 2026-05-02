@@ -575,7 +575,7 @@ class PolicyArbiter:
         return DEFAULT_HTTP_REFERER
 
     def _telegram_fallback_binary(self) -> str | None:
-        telegram_cfg = self.runtime_config.get("telegram") if isinstance(self.runtime_config.get("telegram"), dict) else {}
+        telegram_cfg: dict[str, Any] = self.runtime_config.get("telegram") if isinstance(self.runtime_config.get("telegram"), dict) else {}
         configured_binary = str(telegram_cfg.get("fallback_binary") or "").strip()
         if configured_binary:
             return configured_binary
@@ -1265,7 +1265,7 @@ class PolicyArbiter:
         return parsed
 
     def _resolve_openclaw_binary(self) -> Path | None:
-        telegram_cfg = self.runtime_config.get("telegram") if isinstance(self.runtime_config.get("telegram"), dict) else {}
+        telegram_cfg: dict[str, Any] = self.runtime_config.get("telegram") if isinstance(self.runtime_config.get("telegram"), dict) else {}
         configured_binary = str(telegram_cfg.get("fallback_binary") or "").strip()
         allowed_paths = {path.expanduser().resolve(strict=False) for path in OPENCLAW_FALLBACK_BINARY_PATHS}
         if configured_binary:

@@ -1081,8 +1081,10 @@ class TestPolicyArbiterHandlers:
 
     def test_validate_file_path_outside_root(self) -> None:
         arbiter = _make_arbiter()
-        # Create a file in home (not in forbidden prefixes) but outside allowed roots
-        test_file = Path.home() / "test_outside.py"
+        # Override base_dir to the project root so /tmp is genuinely outside allowed roots.
+        # This avoids the root-user fragility where Path.home() -> /root (forbidden prefix).
+        arbiter.base_dir = Path(__file__).resolve().parents[2]
+        test_file = Path("/tmp") / "cerebellum_test_outside.py"
         test_file.touch()
         try:
             with pytest.raises(ValueError, match="outside allowed roots"):
