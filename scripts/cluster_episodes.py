@@ -2,23 +2,16 @@
 from __future__ import annotations
 
 import logging
-import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+BASE_DIR = Path(__file__).resolve().parent
 
-BASE_DIR = Path(__file__).resolve().parent.parent
-SRC_DIR = BASE_DIR / "src"
-if str(SRC_DIR) not in sys.path:
-    sys.path.insert(0, str(SRC_DIR))
-
-from events import CerebellumEventEmitter  # noqa: E402
-from hippocampus import Hippocampus  # noqa: E402
-
+from cerebellum.events import CerebellumEventEmitter
+from cerebellum.hippocampus import Hippocampus
 
 logger = logging.getLogger(__name__)
-
 
 def cluster_by_time(events: list[dict[str, Any]], threshold_minutes: int = 5) -> list[list[dict[str, Any]]]:
     if not events:

@@ -1,11 +1,11 @@
 """Policy-driven action arbiter for evaluating and executing hypotheses."""
 
+import fnmatch
+import ipaddress
 import json
 import logging
 import math
 import os
-import ipaddress
-import fnmatch
 import re
 import shutil
 import stat
@@ -16,19 +16,16 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
-from http.client import HTTPSConnection
 from collections import deque
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
+from http.client import HTTPSConnection
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 import yaml
 
-try:
-    from .http_safe import NoRedirectHandler, _safe_opener
-except ImportError:
-    from http_safe import NoRedirectHandler, _safe_opener
+from cerebellum.http_safe import NoRedirectHandler, _safe_opener
 
 logger = logging.getLogger(__name__)
 
@@ -112,13 +109,13 @@ class DailyCostTracker:
     def __init__(self, max_cost: float):
         self.max_cost = max_cost
         self._lock = threading.RLock()
-        self._day = datetime.now(timezone.utc).date()
+        self._day = datetime.now(UTC).date()
         self._spent = 0.0
 
     def allow(self, additional_cost: float) -> bool:
         with self._lock:
             additional = max(additional_cost, 0.0)
-            today = datetime.now(timezone.utc).date()
+            today = datetime.now(UTC).date()
             if today != self._day:
                 self._day = today
                 self._spent = 0.0
@@ -129,7 +126,7 @@ class DailyCostTracker:
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
-            today = datetime.now(timezone.utc).date()
+            today = datetime.now(UTC).date()
             if today != self._day:
                 self._day = today
                 self._spent = 0.0
@@ -309,7 +306,7 @@ class BasalGanglia:
             return {
                 "hypothesis_id": hypothesis_id,
                 "status": "blocked",
-                "executed_at": datetime.now(timezone.utc).isoformat(),
+                "executed_at": datetime.now(UTC).isoformat(),
                 "results": [],
                 "reason": "kill switch enabled",
             }
@@ -345,7 +342,7 @@ class BasalGanglia:
         payload = {
             "hypothesis_id": hypothesis_id,
             "status": "completed" if success else "partial_failure",
-            "executed_at": datetime.now(timezone.utc).isoformat(),
+            "executed_at": datetime.now(UTC).isoformat(),
             "execution_cost": round(execution_cost, 6),
             "execution_cost_limit": round(execution_cost_limit, 6),
             "results": results,
@@ -377,23 +374,22 @@ class BasalGanglia:
             "hypothesis_id": hypothesis_id,
             "message_id": message_id,
             "status": "pending",
-            "staged_at": datetime.now(timezone.utc).isoformat(),
-            "expires_at": (datetime.now(timezone.utc) + timedelta(minutes=timeout_minutes)).isoformat(),
+            "staged_at": datetime.now(UTC).isoformat(),
+            "expires_at": (datetime.now(UTC) + timedelta(minutes=timeout_minutes)).isoformat(),
             "hypothesis": sanitized_hypothesis,
             "telegram_result": telegram_result,
         }
         import fcntl
 
         lock_path = self.pending_file.with_suffix(".json.lock")
-        with self._lock:
-            with lock_path.open("w", encoding="utf-8") as lock_f:
-                fcntl.flock(lock_f.fileno(), fcntl.LOCK_EX)
-                try:
-                    pending = self._load_json(self.pending_file, default={})
-                    pending[hypothesis_id] = record
-                    self._save_json(self.pending_file, pending)
-                finally:
-                    fcntl.flock(lock_f.fileno(), fcntl.LOCK_UN)
+        with self._lock, lock_path.open("w", encoding="utf-8") as lock_f:
+            fcntl.flock(lock_f.fileno(), fcntl.LOCK_EX)
+            try:
+                pending = self._load_json(self.pending_file, default={})
+                pending[hypothesis_id] = record
+                self._save_json(self.pending_file, pending)
+            finally:
+                fcntl.flock(lock_f.fileno(), fcntl.LOCK_UN)
         self._update_hypothesis_state(hypothesis_id, "pending_approval", record)
         self._emit_event("cerebellum.approval.staged", record)
         return message_id
@@ -406,7 +402,7 @@ class BasalGanglia:
             "hypothesis_id": hypothesis_id,
             "decision": decision,
             "user_id": user_id,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "timestamp": datetime.now(UTC).isoformat(),
         }
         try:
             if decision == "approve":
@@ -417,23 +413,22 @@ class BasalGanglia:
                     response["error"] = "kill switch enabled"
                     return response
 
-            with self._lock:
-                with lock_path.open("w", encoding="utf-8") as lock_f:
-                    fcntl.flock(lock_f.fileno(), fcntl.LOCK_EX)
-                    try:
-                        pending = self._load_json(self.pending_file, default={})
-                        record = pending.get(hypothesis_id, {})
-                        if decision == "snooze":
-                            record["expires_at"] = (
-                                datetime.now(timezone.utc) + timedelta(hours=1)
-                            ).isoformat()
-                            pending[hypothesis_id] = record
-                            self._save_json(self.pending_file, pending)
-                        elif decision in {"approve", "reject"}:
-                            pending.pop(hypothesis_id, None)
-                            self._save_json(self.pending_file, pending)
-                    finally:
-                        fcntl.flock(lock_f.fileno(), fcntl.LOCK_UN)
+            with self._lock, lock_path.open("w", encoding="utf-8") as lock_f:
+                fcntl.flock(lock_f.fileno(), fcntl.LOCK_EX)
+                try:
+                    pending = self._load_json(self.pending_file, default={})
+                    record = pending.get(hypothesis_id, {})
+                    if decision == "snooze":
+                        record["expires_at"] = (
+                            datetime.now(UTC) + timedelta(hours=1)
+                        ).isoformat()
+                        pending[hypothesis_id] = record
+                        self._save_json(self.pending_file, pending)
+                    elif decision in {"approve", "reject"}:
+                        pending.pop(hypothesis_id, None)
+                        self._save_json(self.pending_file, pending)
+                finally:
+                    fcntl.flock(lock_f.fileno(), fcntl.LOCK_UN)
 
             if decision == "approve":
                 hypothesis = record.get("hypothesis", {})
@@ -468,7 +463,7 @@ class BasalGanglia:
         self._persist_state()
         payload = {
             "kill_switch": self.kill_switch,
-            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "updated_at": datetime.now(UTC).isoformat(),
             "command": self.kill_switch_command,
         }
         self._emit_event("cerebellum.kill_switch", payload)
@@ -563,7 +558,7 @@ class BasalGanglia:
         tmp_path = path.with_suffix(path.suffix + ".tmp")
         payload = {
             "kill_switch": bool(enabled),
-            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "updated_at": datetime.now(UTC).isoformat(),
         }
         data = json.dumps(payload, ensure_ascii=False)
         try:
@@ -758,7 +753,7 @@ class BasalGanglia:
             hypothesis_id=hypothesis_id,
             decision=decision,
             reason=reason,
-            timestamp=datetime.now(timezone.utc).isoformat(),
+            timestamp=datetime.now(UTC).isoformat(),
         )
         payload = action_decision.to_dict()
         self.recent_decisions.append(action_decision)
@@ -976,7 +971,7 @@ class BasalGanglia:
         return {"status": "ok", "tool": "notification.send", "result": result}
 
     def _send_telegram_message(
-        self, text: str, keyboard: Optional[list[list[dict[str, str]]]] = None
+        self, text: str, keyboard: list[list[dict[str, str]]] | None = None
     ) -> dict[str, Any]:
         bot_token = os.environ.get("TELEGRAM_BOT_TOKEN") or os.environ.get("OPENCLAW_TELEGRAM_BOT_TOKEN")
         chat_id = os.environ.get("TELEGRAM_CHAT_ID") or os.environ.get("OPENCLAW_TELEGRAM_CHAT_ID")
@@ -1147,7 +1142,7 @@ class BasalGanglia:
         state_data = self._load_json(self.state_dir / "hypothesis_states.json", default={})
         state_data[hypothesis_id] = {
             "state": state,
-            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "updated_at": datetime.now(UTC).isoformat(),
             "payload": payload,
         }
         self._save_json(self.state_dir / "hypothesis_states.json", state_data)
@@ -1178,7 +1173,7 @@ class BasalGanglia:
         record = {
             "topic": topic,
             "payload": payload,
-            "created_at": datetime.now(timezone.utc).isoformat(),
+            "created_at": datetime.now(UTC).isoformat(),
         }
         try:
             self._append_jsonl(fallback_path, record)
@@ -1237,6 +1232,5 @@ class BasalGanglia:
                 raise
 
     def _append_jsonl(self, path: Path, payload: dict[str, Any]) -> None:
-        with self._lock:
-            with path.open("a", encoding="utf-8") as handle:
-                handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        with self._lock, path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, ensure_ascii=False) + "\n")

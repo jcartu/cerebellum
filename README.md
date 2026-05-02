@@ -157,7 +157,7 @@ curl -H "Authorization: Bearer $DASHBOARD_TOKEN" http://127.0.0.1:18790/healthz
   "nats": { "host": "localhost", "port": 4222, "jetstream_domain": "" },
   "sqlite": { "events_db": "/path/to/events.db" },
   "dashboard": { "port": 18790 },
-  "models": ["openai/gpt-4o", "anthropic/claude-3.5-sonnet"],
+  "models": ["openai/gpt-4o", "anthropic/claude-sonnet-4-6"],
   "generation_interval_minutes": 5
 }
 ```

@@ -9,9 +9,10 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from cerebellum.events import CerebellumEventEmitter
+
 logger = logging.getLogger(__name__)
 BASE_DIR = Path(__file__).resolve().parent.parent
-
 
 class ObservatoryService:
     RELAY_ACTOR = "observatory.nats-subscriber"
@@ -39,22 +40,8 @@ class ObservatoryService:
         self.stop_requested = True
 
     async def _start_emitter(self) -> None:
-        events_module = BASE_DIR / "src" / "events.py"
-        if not events_module.exists():
-            logger.warning("events.py missing; continuing without event emitter")
-            return
-        spec = importlib.util.spec_from_file_location("cerebellum_events", events_module)
-        if spec is None or spec.loader is None:
-            logger.warning("Could not load events module spec")
-            return
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        emitter_cls = getattr(module, "CerebellumEventEmitter", None)
-        if emitter_cls is None:
-            logger.warning("CerebellumEventEmitter not found")
-            return
         try:
-            self._emitter = emitter_cls(str(BASE_DIR / "config.json"))
+            self._emitter = CerebellumEventEmitter(str(Path(__file__).resolve().parent.parent / "config.json"))
             logger.info("Event emitter started (single event store: events.db)")
         except Exception as exc:
             logger.exception("Failed to start event emitter: %s", exc)

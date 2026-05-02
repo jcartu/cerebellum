@@ -1,0 +1,35 @@
+[Unit]
+Description=Cerebellum Observatory (Event Bus + Dashboard)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=__CEREBELLUM_BASE_DIR__
+User=__USER__
+Group=__USER__
+ExecStart=__PYTHON__ -m cerebellum.observatory_main
+Restart=on-failure
+RestartSec=15
+Environment=PYTHONUNBUFFERED=1
+Environment=CEREBELLUM_BASE_DIR=__CEREBELLUM_BASE_DIR__
+EnvironmentFile=__CEREBELLUM_BASE_DIR__/.env
+MemoryMax=1G
+TasksMax=200
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=__CEREBELLUM_BASE_DIR__
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+LockPersonality=true
+RestrictRealtime=true
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,90 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Lint
+        run: ruff check src tests scripts
+
+      - name: Format check
+        run: ruff format --check src tests scripts
+
+      - name: Typecheck
+        run: mypy src/cerebellum
+
+      - name: Test
+        run: pytest -m "not integration"
+
+      - name: Upload coverage
+        if: matrix.python-version == '3.11'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: |
+            coverage.xml
+            htmlcov/
+          retention-days: 14
+
+  coverage-gate:
+    name: Coverage gate
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install
+        run: |
+          pip install --upgrade pip
+          pip install -e ".[dev]" diff-cover
+
+      - name: Compute base coverage
+        run: |
+          git checkout ${{ github.event.pull_request.base.sha }} -- .
+          pip install -e ".[dev]"
+          pytest -m "not integration" --cov-report=xml:base-coverage.xml || true
+          git checkout ${{ github.event.pull_request.head.sha }} -- .
+
+      - name: Run head coverage
+        run: pytest -m "not integration" --cov-report=xml:head-coverage.xml
+
+      - name: Block PR if coverage drops > 2pp
+        run: |
+          python scripts/check_coverage_delta.py base-coverage.xml head-coverage.xml --max-drop 2.0

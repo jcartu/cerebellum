@@ -1,0 +1,281 @@
+# CEREBELLUM Rebuild Log
+
+This file is the persistent state of the rebuild. Every Sisyphus work session ends with an update here. A blank entry at end of a phase means the phase did not complete.
+
+**Maintainer:** Sisyphus (OpenCode + Qwen3.5-27B FP8)
+**Reviewer of last resort:** Claude Opus 4.7 via OpenRouter, capped at 8 calls/phase
+**Plan source:** `CEREBELLUM_REBUILD_PLAN.md` at repo root
+
+---
+
+## Format
+
+For each phase, fill out the section before merging to `main` and tagging `phase-N-complete`.
+
+```
+## Phase N — <name>
+- **Started:** YYYY-MM-DD
+- **Completed:** YYYY-MM-DD
+- **Branch:** phase-N-name
+- **Commit range:** <first sha>..<last sha>
+- **Exit gate result:** PASS | FAIL (and why, if retried)
+
+### What shipped
+- bullet list of concrete deliverables
+
+### What was deferred
+- bullet list with target phase
+
+### Surprises
+- things that were harder, easier, or different than the plan assumed
+
+### Decisions made without Opus
+- one-liner per non-obvious choice + rationale (e.g. "chose pymining over hand-rolled PrefixSpan because the lib is 200 LOC and well-tested")
+
+### Opus calls (max 8 per phase)
+| # | Date | Question | Response summary | Action taken |
+|---|------|----------|------------------|--------------|
+| 1 | ...  | ...      | ...              | ...          |
+
+### Metrics snapshot
+- relevant numbers at end of phase (test coverage, token spend, real event-stream stats, etc.)
+```
+
+---
+
+## Phase 0 — Bootstrap
+
+- **Started:**
+- **Completed:**
+- **Branch:** phase-0-bootstrap
+- **Commit range:**
+- **Exit gate result:**
+
+### What shipped
+
+### What was deferred
+
+### Surprises
+
+### Decisions made without Opus
+
+### Opus calls
+
+| # | Date | Question | Response summary | Action taken |
+|---|------|----------|------------------|--------------|
+
+### Metrics snapshot
+- LOC delta:
+- Test count: before / after
+- Coverage: before / after
+- Opus token spend this phase: $
+
+---
+
+## Phase 1 — Rebrand and honesty
+
+- **Started:**
+- **Completed:**
+- **Branch:** phase-1-rebrand-and-honesty
+- **Commit range:**
+- **Exit gate result:**
+
+### What shipped
+
+### What was deferred
+
+### Surprises
+
+### Decisions made without Opus
+
+### Opus calls
+
+| # | Date | Question | Response summary | Action taken |
+|---|------|----------|------------------|--------------|
+
+### Metrics snapshot
+- Coverage on `event_bus.py`:
+- Coverage on `episode_store.py`:
+- `git grep -i "shadow cognition\|causal"` count outside docs/:
+- Opus token spend this phase: $
+
+---
+
+## Phase 2 — Hypothesis grounding
+
+- **Started:**
+- **Completed:**
+- **Branch:** phase-2-grounding
+- **Commit range:**
+- **Exit gate result:**
+
+### What shipped
+
+### What was deferred
+
+### Surprises
+
+### Decisions made without Opus
+
+### Opus calls
+
+| # | Date | Question | Response summary | Action taken |
+|---|------|----------|------------------|--------------|
+
+### Metrics snapshot
+- 2h integration: % of accepted proposals with valid evidence_event_ids:
+- Verifier-vs-proposer disagreement rate:
+- Coverage on `proposer.py` + `grounding.py`:
+- Opus token spend this phase: $
+
+---
+
+## Phase 3 — Real successor-pattern mining
+
+- **Started:**
+- **Completed:**
+- **Branch:** phase-3-real-causality
+- **Commit range:**
+- **Exit gate result:**
+
+### What shipped
+
+### What was deferred
+
+### Surprises
+
+### Decisions made without Opus
+
+### Opus calls
+
+| # | Date | Question | Response summary | Action taken |
+|---|------|----------|------------------|--------------|
+
+### Metrics snapshot
+- Planted-pattern recovery (3/3 expected):
+- False-positive rate on uniform random stream (0/1000 expected):
+- Edges discovered on real event stream:
+- Lift distribution (p25 / p50 / p75 / max):
+- Coverage on `mining.py`:
+- Opus token spend this phase: $
+
+---
+
+## Phase 4 — Real action surface
+
+- **Started:**
+- **Completed:**
+- **Branch:** phase-4-action-surface
+- **Commit range:**
+- **Exit gate result:**
+
+### What shipped
+
+### What was deferred
+
+### Surprises
+
+### Decisions made without Opus
+
+### Opus calls
+
+| # | Date | Question | Response summary | Action taken |
+|---|------|----------|------------------|--------------|
+
+### Metrics snapshot
+- RASPUTIN tools wired:
+- Live test result (proposal → arbiter → rasputin.search → result):
+- Coverage on action handlers:
+- Opus token spend this phase: $
+
+---
+
+## Phase 5 — Feedback loop
+
+- **Started:**
+- **Completed:**
+- **Branch:** phase-5-feedback-loop
+- **Commit range:**
+- **Exit gate result:**
+
+### What shipped
+
+### What was deferred
+
+### Surprises
+
+### Decisions made without Opus
+
+### Opus calls
+
+| # | Date | Question | Response summary | Action taken |
+|---|------|----------|------------------|--------------|
+
+### Metrics snapshot
+- proposal_outcomes rows after baseline week:
+- Approval rate by proposer model:
+- Verifier-correctness rate:
+- Mean confidence (approved) vs (rejected):
+- Calibration status: uncalibrated | calibrated (and Platt coefficients)
+- Opus token spend this phase: $
+
+---
+
+## Phase 6 — Test, harden, ship
+
+- **Started:**
+- **Completed:**
+- **Branch:** phase-6-test-and-ship
+- **Commit range:**
+- **Exit gate result:**
+
+### What shipped
+
+### What was deferred
+
+### Surprises
+
+### Decisions made without Opus
+
+### Opus calls
+
+| # | Date | Question | Response summary | Action taken |
+|---|------|----------|------------------|--------------|
+
+### Metrics snapshot
+- Global coverage:
+- Per-module coverage (every module ≥ 80%, arbiter/dashboard ≥ 75%):
+- Property test count:
+- Fuzz iterations passed:
+- Top 5 issues from final Opus audit (and disposition):
+- Opus token spend this phase: $
+- **Total Opus token spend across rebuild: $**
+
+---
+
+## Cross-cutting log
+
+Anything that doesn't fit a phase. Format: `YYYY-MM-DD — note`.
+
+- 
+
+---
+
+## Open questions parking lot
+
+When a question comes up that's out of scope for the current phase but should not be lost, file it here with a target phase. Phase exit reviews check this list.
+
+- 
+
+---
+
+## Known limitations (running list)
+
+This list is what goes in the README's "Limitations" section in Phase 1 and gets updated every phase. Honesty pass: if a claim moves from "limitation" to "implemented," delete it here and add a test that proves the implementation.
+
+- Hypothesis confidence is self-reported by the LLM; no calibration until Phase 5 reaches 100+ outcomes per model.
+- Successor-edge mining is association, not causation. Lift filtering reduces false positives but does not establish causality.
+- Reversal detection (was an auto-executed action later undone by the user?) is a stub until destructive tools come online.
+- No mTLS on the NATS connection; single-host deployment assumed.
+- Auto-execute action surface is intentionally narrow (read-only by default). Adding write tools requires a separate threat model review.
+- 

@@ -2,21 +2,13 @@
 from __future__ import annotations
 
 import logging
-import sys
 from pathlib import Path
 
+BASE_DIR = Path(__file__).resolve().parent
 
-BASE_DIR = Path(__file__).resolve().parent.parent
-SRC_DIR = BASE_DIR / "src"
-if str(SRC_DIR) not in sys.path:
-    sys.path.insert(0, str(SRC_DIR))
-
-from hippocampus import Hippocampus  # noqa: E402
-
+from cerebellum.hippocampus import Hippocampus
 
 logger = logging.getLogger(__name__)
-
-
 def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s - %(message)s")
     try:

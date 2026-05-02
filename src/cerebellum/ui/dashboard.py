@@ -14,40 +14,23 @@ import time
 import urllib.error
 import urllib.request
 from collections import Counter
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+import uvicorn
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
-import uvicorn
 
-try:
-    from ..http_safe import _safe_opener
-except ImportError:
-    from http_safe import _safe_opener
-
-try:
-    from ..events import CerebellumEventEmitter
-except ImportError:
-    import sys
-
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-    from src.events import CerebellumEventEmitter  # type: ignore[no-redef]
-
-try:
-    from ..arbiter import BasalGanglia  # type: ignore[import-not-found]
-except ImportError:
-    import sys as _sys
-
-    _sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-    from src.arbiter import BasalGanglia  # type: ignore[no-redef]
+from cerebellum.arbiter import BasalGanglia
+from cerebellum.events import CerebellumEventEmitter
+from cerebellum.http_safe import _safe_opener
 
 logger = logging.getLogger(__name__)
 
 
 def _base_dir() -> Path:
-    return Path(os.environ.get("CEREBELLUM_BASE_DIR", "/home/josh/.openclaw/cerebellum")).expanduser()
+    return Path(os.environ.get("CEREBELLUM_BASE_DIR", str(Path(__file__).resolve().parents[3]))).expanduser()
 
 
 def _config_path() -> Path:
@@ -183,7 +166,7 @@ async def auth_middleware(request: Request, call_next: Any) -> Any:
 
 def _stats_payload() -> dict[str, Any]:
     emitter = get_emitter()
-    since = datetime.now(timezone.utc) - timedelta(hours=24)
+    since = datetime.now(UTC) - timedelta(hours=24)
     events = emitter.query(since=since, limit=10000)
     counts = dict(Counter(event["type"] for event in events))
     return {"window": "24h", "counts": counts, "total": len(events)}
@@ -193,7 +176,7 @@ def _parse_since(raw_since: str | None) -> datetime | None:
     if not raw_since:
         return None
     try:
-        return datetime.fromisoformat(raw_since).astimezone(timezone.utc)
+        return datetime.fromisoformat(raw_since).astimezone(UTC)
     except ValueError:
         return None
 
@@ -346,7 +329,7 @@ async def api_events_stream(request: Request) -> StreamingResponse:
     emitter = get_emitter()
 
     async def event_generator() -> Any:
-        last_seen = datetime.now(timezone.utc) - timedelta(seconds=5)
+        last_seen = datetime.now(UTC) - timedelta(seconds=5)
         try:
             while True:
                 if await request.is_disconnected():
@@ -355,7 +338,7 @@ async def api_events_stream(request: Request) -> StreamingResponse:
                     for event in reversed(emitter.query(since=last_seen, limit=100)):
                         if await request.is_disconnected():
                             break
-                        event_time = datetime.fromisoformat(event["timestamp"]).astimezone(timezone.utc)
+                        event_time = datetime.fromisoformat(event["timestamp"]).astimezone(UTC)
                         if event_time > last_seen:
                             last_seen = event_time
                         yield f"data: {json.dumps(event, default=str)}\n\n"

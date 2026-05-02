@@ -11,20 +11,16 @@ import urllib.error
 import urllib.request
 from collections import Counter
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 import kuzu
 
-try:
-    from .http_safe import _safe_opener
-except ImportError:
-    from http_safe import _safe_opener
-
+from cerebellum.http_safe import _safe_opener
 
 logger = logging.getLogger(__name__)
-
+BASE_DIR = Path(__file__).resolve().parent.parent
 
 @dataclass(slots=True)
 class LLMResponse:
@@ -35,8 +31,7 @@ class LLMResponse:
 class Hippocampus:
     """Causal memory engine using KuzuDB graph + Qdrant vectors."""
 
-    GRAPH_DIR = Path("/home/josh/.openclaw/cerebellum/graph")
-    DEFAULT_OPENROUTER_MODEL = "openai/gpt-4o"
+    GRAPH_DIR = Path(os.environ.get("CEREBELLUM_BASE_DIR", str(Path(__file__).resolve().parents[2]))).expanduser() / "graph"
     DEFAULT_OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
     _READ_ONLY_QUERY_PREFIXES = ("MATCH", "CALL", "UNWIND", "WITH", "RETURN", "EXPLAIN", "PROFILE")
     _READ_ONLY_BLOCKED_KEYWORDS = (
@@ -271,7 +266,7 @@ class Hippocampus:
         return list(entities.values())
 
     def mine_causal_edges(self, window_hours: int = 168) -> list[dict[str, Any]]:
-        since = (datetime.now(timezone.utc) - timedelta(hours=window_hours)).isoformat()
+        since = (datetime.now(UTC) - timedelta(hours=window_hours)).isoformat()
         discovered: list[dict[str, Any]] = []
 
         try:
@@ -334,8 +329,8 @@ class Hippocampus:
                 continue
 
             confidence = round(support / max(source_counts[source_type], 1), 4)
-            edge_id = f"causal:{hashlib.sha1(f'{source_type}->{target_type}'.encode('utf-8')).hexdigest()[:16]}"
-            timestamp = datetime.now(timezone.utc).isoformat()
+            edge_id = f"causal:{hashlib.sha1(f'{source_type}->{target_type}'.encode()).hexdigest()[:16]}"
+            timestamp = datetime.now(UTC).isoformat()
 
             try:
                 with self._write_lock:
@@ -613,7 +608,7 @@ class Hippocampus:
         elif not isinstance(payload, dict):
             payload = {"raw": payload}
 
-        timestamp = str(event.get("timestamp") or datetime.now(timezone.utc).isoformat())
+        timestamp = str(event.get("timestamp") or datetime.now(UTC).isoformat())
         self._parse_timestamp(timestamp)
 
         normalized = {
@@ -816,11 +811,11 @@ User request: {natural_language}
         return re.sub(r"--.*$", "", without_block_comments, flags=re.MULTILINE)
 
     def _hash_payload(self, payload: dict[str, Any], timestamp: str) -> str:
-        digest = hashlib.sha1(f"{timestamp}|{json.dumps(payload, sort_keys=True, default=str)}".encode("utf-8")).hexdigest()
+        digest = hashlib.sha1(f"{timestamp}|{json.dumps(payload, sort_keys=True, default=str)}".encode()).hexdigest()
         return f"event:{digest[:16]}"
 
     def _entity_id(self, entity_type: str, name: str) -> str:
-        digest = hashlib.sha1(f"{entity_type}:{name.lower()}".encode("utf-8")).hexdigest()
+        digest = hashlib.sha1(f"{entity_type}:{name.lower()}".encode()).hexdigest()
         return f"entity:{digest[:16]}"
 
     def _entity_key(self, entity_type: str, name: str) -> str:

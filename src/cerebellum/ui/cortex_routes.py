@@ -1,15 +1,12 @@
 from __future__ import annotations
 
-import sys
+import os
 from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query
 
-BASE_DIR = Path("/home/josh/.openclaw/cerebellum")
-src_dir = Path(__file__).resolve().parents[1]
-if str(src_dir) not in sys.path:
-    sys.path.insert(0, str(src_dir))
+from cerebellum.cortex import PrefrontalCortex
 
 router = APIRouter(tags=["cerebellum-hypotheses"])
 
@@ -20,9 +17,8 @@ _cortex: Any = None
 def _get_cortex():
     global _cortex
     if _cortex is None:
-        from cortex import PrefrontalCortex
-
-        _cortex = PrefrontalCortex(config_path=str(BASE_DIR / "config.json"))
+        base_dir = Path(os.environ.get("CEREBELLUM_BASE_DIR", str(Path(__file__).resolve().parents[3]))).expanduser()
+        _cortex = PrefrontalCortex(config_path=str(base_dir / "config.json"))
     return _cortex
 
 

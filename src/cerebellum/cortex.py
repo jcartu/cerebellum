@@ -8,9 +8,9 @@ import threading
 import time
 import uuid
 from dataclasses import asdict, dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 try:
     from openai import OpenAI
@@ -18,7 +18,7 @@ except ImportError:  # pragma: no cover - handled gracefully at runtime
     OpenAI = None  # type: ignore[assignment]
 
 logger = logging.getLogger(__name__)
-
+BASE_DIR = Path(__file__).resolve().parent.parent
 EMPTY_USAGE: dict[str, Any] = {
     "prompt_tokens": 0,
     "completion_tokens": 0,
@@ -50,7 +50,7 @@ class Hypothesis:
 class PrefrontalCortex:
     """Hypothesis generation engine."""
 
-    DEFAULT_MODELS = ["openai/gpt-4o", "anthropic/claude-opus-4.7"]
+    DEFAULT_MODELS = ["openai/gpt-4o", "anthropic/claude-opus-4-7"]
     VALID_STATES = {
         "proposed",
         "staged",
@@ -228,7 +228,7 @@ class PrefrontalCortex:
                     for item in existing[:10]
                 ],
                 "generation_interval_minutes": self.generation_interval_minutes,
-                "current_time": datetime.now(timezone.utc).isoformat(),
+                "current_time": datetime.now(UTC).isoformat(),
             }
             return (
                 "You are the prefrontal cortex for CEREBELLUM, a shadow cognition layer for RASPUTIN. "
@@ -443,7 +443,7 @@ class PrefrontalCortex:
             except Exception as exc:
                 logger.warning("Cortex WAL checkpoint failed: %s", exc)
 
-    def get_active_hypotheses(self, state: Optional[str] = None, limit: int = 50) -> list[dict]:
+    def get_active_hypotheses(self, state: str | None = None, limit: int = 50) -> list[dict]:
         """Query hypotheses by state."""
         try:
             sql = "SELECT * FROM hypotheses"
@@ -461,7 +461,7 @@ class PrefrontalCortex:
             logger.error("Failed to query hypotheses: %s", exc)
             return []
 
-    def get_hypothesis(self, hypothesis_id: str) -> Optional[dict[str, Any]]:
+    def get_hypothesis(self, hypothesis_id: str) -> dict[str, Any] | None:
         try:
             with self._db_lock:
                 conn = self._get_connection()
@@ -486,7 +486,7 @@ class PrefrontalCortex:
                     "from": hypothesis.get("state"),
                     "to": new_state,
                     "reason": reason,
-                    "at": datetime.now(timezone.utc).isoformat(),
+                    "at": datetime.now(UTC).isoformat(),
                 }
             )
             metadata["state_transitions"] = transitions
@@ -513,7 +513,7 @@ class PrefrontalCortex:
     def expire_old_hypotheses(self, max_age_hours: int = 24) -> int:
         """Mark old 'proposed' hypotheses as 'expired'."""
         try:
-            cutoff = (datetime.now(timezone.utc) - timedelta(hours=max_age_hours)).isoformat()
+            cutoff = (datetime.now(UTC) - timedelta(hours=max_age_hours)).isoformat()
             expired_ids: list[str] = []
             with self._db_lock:
                 conn = self._get_connection()
@@ -568,7 +568,7 @@ class PrefrontalCortex:
                 "avg_confidence": round(float(aggregates["avg_confidence"] or 0.0), 3),
                 "avg_utility": round(float(aggregates["avg_utility"] or 0.0), 3),
                 "avg_cost": round(float(aggregates["avg_cost"] or 0.0), 3),
-                "generated_at": datetime.now(timezone.utc).isoformat(),
+                "generated_at": datetime.now(UTC).isoformat(),
             }
         except Exception as exc:
             logger.error("Failed to compute hypothesis stats: %s", exc)
@@ -578,13 +578,13 @@ class PrefrontalCortex:
                 "avg_confidence": 0.0,
                 "avg_utility": 0.0,
                 "avg_cost": 0.0,
-                "generated_at": datetime.now(timezone.utc).isoformat(),
+                "generated_at": datetime.now(UTC).isoformat(),
             }
 
     def _get_recent_episodes(self, hours: int) -> list[dict[str, Any]]:
         if not self.hippocampus:
             return []
-        since = datetime.now(timezone.utc) - timedelta(hours=hours)
+        since = datetime.now(UTC) - timedelta(hours=hours)
         for method_name, kwargs in (
             ("get_recent_episodes", {"since": since}),
             ("get_recent_episodes", {"hours": hours}),
@@ -605,7 +605,7 @@ class PrefrontalCortex:
     def _get_recent_events(self, minutes: int) -> list[dict[str, Any]]:
         if not self.emitter:
             return []
-        since = datetime.now(timezone.utc) - timedelta(minutes=minutes)
+        since = datetime.now(UTC) - timedelta(minutes=minutes)
         for method_name, kwargs in (
             ("get_recent_events", {"since": since}),
             ("get_recent_events", {"minutes": minutes}),
@@ -663,7 +663,7 @@ class PrefrontalCortex:
         episodes: list,
         events: list,
         usage: dict[str, Any] | None = None,
-    ) -> Optional[Hypothesis]:
+    ) -> Hypothesis | None:
         try:
             title = str(item.get("title", "")).strip()
             description = str(item.get("description", "")).strip()
@@ -699,7 +699,7 @@ class PrefrontalCortex:
             metadata.setdefault("cost_completion_tokens", completion_tokens)
             return Hypothesis(
                 id=str(uuid.uuid4()),
-                timestamp=datetime.now(timezone.utc).isoformat(),
+                timestamp=datetime.now(UTC).isoformat(),
                 title=title,
                 description=description,
                 confidence=self._clamp_float(item.get("confidence", 0.0)),
@@ -721,7 +721,7 @@ class PrefrontalCortex:
         # model_id: (prompt_price, completion_price)
         "openai/gpt-4o": (2.50, 10.00),
         "openai/gpt-4o-mini": (0.15, 0.60),
-        "anthropic/claude-opus-4.7": (15.00, 75.00),
+        "anthropic/claude-opus-4-7": (15.00, 75.00),
         "anthropic/claude-sonnet-4": (3.00, 15.00),
         "anthropic/claude-haiku-4": (0.80, 4.00),
         "google/gemini-2.0-flash": (0.10, 0.40),

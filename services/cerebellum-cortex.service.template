@@ -1,0 +1,35 @@
+[Unit]
+Description=Cerebellum Cortex (Proposer + Policy Arbiter)
+After=network-online.target cerebellum-observatory.service
+Wants=network-online.target cerebellum-observatory.service
+
+[Service]
+Type=simple
+WorkingDirectory=__CEREBELLUM_BASE_DIR__
+User=__USER__
+Group=__USER__
+ExecStart=__PYTHON__ -m cerebellum.scripts.arbiter_loop
+Restart=on-failure
+RestartSec=15
+Environment=PYTHONUNBUFFERED=1
+Environment=CEREBELLUM_BASE_DIR=__CEREBELLUM_BASE_DIR__
+EnvironmentFile=__CEREBELLUM_BASE_DIR__/.env
+MemoryMax=2G
+TasksMax=200
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=__CEREBELLUM_BASE_DIR__
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+LockPersonality=true
+RestrictRealtime=true
+
+[Install]
+WantedBy=default.target
