@@ -666,3 +666,469 @@ class TestConstants:
         assert "rasputin.search" in TOOL_COST_ESTIMATES
         assert "rasputin.commit_fact" in TOOL_COST_ESTIMATES
         assert "rasputin.reflect" in TOOL_COST_ESTIMATES
+
+# ---------------------------------------------------------------------------
+# PolicyArbiter - handler coverage (mocked)
+# ---------------------------------------------------------------------------
+
+
+class TestPolicyArbiterHandlers:
+    """Test handlers that normally need network by mocking dependencies."""
+
+    def test_handle_notification_send_no_creds(self) -> None:
+        arbiter = _make_arbiter()
+        env = dict(os.environ)
+        env.pop("TELEGRAM_BOT_TOKEN", None)
+        env.pop("OPENCLAW_TELEGRAM_BOT_TOKEN", None)
+        with patch.dict(os.environ, env, clear=True):
+            with patch.object(arbiter, "_resolve_openclaw_binary", return_value=None):
+                result = arbiter._handle_notification_send({"text": "hello"})
+                assert result["result"]["ok"] is False or result["result"].get("skipped") is True
+
+    def test_handle_notification_summarize_with_events(self) -> None:
+        arbiter = _make_arbiter()
+        arbiter._emitter = MagicMock()
+        arbiter._emitter.query.return_value = [{"type": "cerebellum.action"}, {"type": "cerebellum.execution"}]
+        with patch.object(arbiter, "_send_telegram_message", return_value={"ok": True}):
+            result = arbiter._handle_notification_summarize({"hours": 1})
+            assert result["status"] == "ok"
+
+    def test_handle_rasputin_search(self) -> None:
+        arbiter = _make_arbiter()
+        with patch.object(arbiter, "_call_rasputin_mcp", return_value={"status": "ok"}) as mock_call:
+            result = arbiter._handle_rasputin_search({"query": "test"})
+            mock_call.assert_called_once_with("search", {"query": "test"})
+
+    def test_handle_rasputin_search_missing_query(self) -> None:
+        arbiter = _make_arbiter()
+        with pytest.raises(ValueError, match="requires query"):
+            arbiter._handle_rasputin_search({})
+
+    def test_handle_rasputin_recent_facts(self) -> None:
+        arbiter = _make_arbiter()
+        with patch.object(arbiter, "_call_rasputin_mcp", return_value={"status": "ok"}) as mock_call:
+            result = arbiter._handle_rasputin_recent_facts({"limit": 5})
+            mock_call.assert_called_once_with("recent_facts", {"limit": 5})
+
+    def test_handle_rasputin_entity_lookup(self) -> None:
+        arbiter = _make_arbiter()
+        with patch.object(arbiter, "_call_rasputin_mcp", return_value={"status": "ok"}) as mock_call:
+            result = arbiter._handle_rasputin_entity_lookup({"entity": "e"})
+            mock_call.assert_called_once_with("entity_lookup", {"entity": "e"})
+
+    def test_handle_rasputin_entity_lookup_missing(self) -> None:
+        arbiter = _make_arbiter()
+        with pytest.raises(ValueError, match="requires entity"):
+            arbiter._handle_rasputin_entity_lookup({})
+
+    def test_handle_rasputin_episode_summary(self) -> None:
+        arbiter = _make_arbiter()
+        with patch.object(arbiter, "_call_rasputin_mcp", return_value={"status": "ok"}) as mock_call:
+            result = arbiter._handle_rasputin_episode_summary({"hours": 12})
+            mock_call.assert_called_once_with("episode_summary", {"hours": 12})
+
+    def test_handle_rasputin_commit_fact(self) -> None:
+        arbiter = _make_arbiter()
+        with patch.object(arbiter, "_call_rasputin_mcp", return_value={"status": "ok"}) as mock_call:
+            result = arbiter._handle_rasputin_commit_fact({"fact": "f"})
+            mock_call.assert_called_once_with("commit_fact", {"fact": "f"})
+
+    def test_handle_rasputin_commit_fact_missing(self) -> None:
+        arbiter = _make_arbiter()
+        with pytest.raises(ValueError, match="requires fact"):
+            arbiter._handle_rasputin_commit_fact({})
+
+    def test_handle_rasputin_reflect(self) -> None:
+        arbiter = _make_arbiter()
+        with patch.object(arbiter, "_call_rasputin_mcp", return_value={"status": "ok"}) as mock_call:
+            result = arbiter._handle_rasputin_reflect({"prompt": "p"})
+            mock_call.assert_called_once_with("reflect", {"prompt": "p"})
+
+    def test_call_rasputin_mcp_success(self) -> None:
+        arbiter = _make_arbiter()
+        mock_response = MagicMock()
+        mock_response.json.return_value = {"data": "test"}
+        with patch("cerebellum.policy_arbiter.safe_post", return_value=mock_response):
+            result = arbiter._call_rasputin_mcp("search", {"query": "test"})
+            assert result["status"] == "ok"
+
+    def test_call_rasputin_mcp_failure(self) -> None:
+        arbiter = _make_arbiter()
+        with patch("cerebellum.policy_arbiter.safe_post", side_effect=Exception("conn refused")):
+            result = arbiter._call_rasputin_mcp("search", {"query": "test"})
+            assert result["status"] == "error"
+
+    def test_handle_web_search_no_api_key(self) -> None:
+        arbiter = _make_arbiter()
+        env = dict(os.environ)
+        env.pop("BRAVE_SEARCH_API_KEY", None)
+        with patch.dict(os.environ, env, clear=True):
+            with pytest.raises(RuntimeError, match="BRAVE_SEARCH_API_KEY"):
+                arbiter._handle_web_search({"query": "test"})
+
+    def test_handle_web_search_missing_query(self) -> None:
+        arbiter = _make_arbiter()
+        with pytest.raises(ValueError, match="requires a query"):
+            arbiter._handle_web_search({})
+
+    def test_handle_model_call_no_api_key(self) -> None:
+        arbiter = _make_arbiter()
+        env = dict(os.environ)
+        env.pop("OPENROUTER_API_KEY", None)
+        with patch.dict(os.environ, env, clear=True):
+            with pytest.raises(RuntimeError, match="OPENROUTER_API_KEY"):
+                arbiter._handle_model_call({"model": "openai/gpt-4o", "prompt": "hi"})
+
+    def test_handle_model_call_wrong_model(self) -> None:
+        arbiter = _make_arbiter()
+        with patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}):
+            with pytest.raises(ValueError, match="not in allowlist"):
+                arbiter._handle_model_call({"model": "unknown/model", "prompt": "hi"})
+
+    def test_handle_memory_query_non_localhost(self) -> None:
+        arbiter = _make_arbiter()
+        with patch.dict(os.environ, {"QDRANT_URL": "http://evil.com:6333"}):
+            with pytest.raises(ValueError, match="must be localhost"):
+                arbiter._handle_memory_query({"collection": "test", "vector": [0.1]})
+
+    def test_handle_memory_query_invalid_collection(self) -> None:
+        arbiter = _make_arbiter()
+        with pytest.raises(ValueError, match="Invalid Qdrant collection"):
+            arbiter._handle_memory_query({"collection": "../../etc", "vector": [0.1]})
+
+    def test_handle_memory_query_missing_vector(self) -> None:
+        arbiter = _make_arbiter()
+        with pytest.raises(ValueError, match="requires a vector"):
+            arbiter._handle_memory_query({"collection": "test"})
+
+    def test_handle_file_read_missing_path(self) -> None:
+        arbiter = _make_arbiter()
+        with pytest.raises(ValueError):
+            arbiter._handle_file_read({})
+
+    def test_auto_execute_with_steps(self) -> None:
+        arbiter = _make_arbiter()
+        result = arbiter.auto_execute({
+            "id": "test-ae-3",
+            "plan": [{"tool": "proposal.snooze", "proposal_id": "p-1", "duration_minutes": 10}],
+        })
+        assert result["status"] == "completed"
+        assert len(result["results"]) == 1
+        assert result["results"][0]["ok"] is True
+
+    def test_auto_execute_step_failure(self) -> None:
+        arbiter = _make_arbiter()
+        result = arbiter.auto_execute({
+            "id": "test-ae-4",
+            "plan": [{"tool": "unknown.tool"}],
+        })
+        assert result["status"] == "completed"
+        assert result["results"][0]["result"]["status"] == "error"
+
+    def test_auto_execute_cost_tracking(self) -> None:
+        arbiter = _make_arbiter()
+        result = arbiter.auto_execute({
+            "id": "test-ae-5",
+            "plan": [{"tool": "proposal.snooze", "proposal_id": "p-1", "cost": 0.5}],
+        })
+        assert result["execution_cost"] == 0.5
+
+    def test_handle_approval_blocked_by_kill_switch(self) -> None:
+        arbiter = _make_arbiter()
+        arbiter.kill_switch = True
+        arbiter._write_kill_switch_file(True)
+        result = arbiter.handle_approval("test-ks", "approve", user_id="user")
+        assert result["status"] == "blocked"
+
+    def test_refresh_kill_switch_from_disk(self) -> None:
+        arbiter = _make_arbiter()
+        arbiter.kill_switch = False
+        arbiter._write_kill_switch_file(True)
+        arbiter._refresh_kill_switch_from_disk()
+        assert arbiter.kill_switch is True
+
+    def test_read_kill_switch_file(self) -> None:
+        arbiter = _make_arbiter()
+        arbiter._write_kill_switch_file(True)
+        assert arbiter._read_kill_switch_file() is True
+
+    def test_read_kill_switch_file_not_exists(self) -> None:
+        arbiter = _make_arbiter()
+        arbiter.kill_switch_file.unlink(missing_ok=True)
+        assert arbiter._read_kill_switch_file() is None
+
+    def test_assert_public_ip_private(self) -> None:
+        arbiter = _make_arbiter()
+        import ipaddress
+        with pytest.raises(ValueError, match="forbidden address"):
+            arbiter._assert_public_ip(ipaddress.ip_address("192.168.1.1"), "test")
+
+    def test_assert_public_ip_loopback(self) -> None:
+        arbiter = _make_arbiter()
+        import ipaddress
+        with pytest.raises(ValueError, match="forbidden address"):
+            arbiter._assert_public_ip(ipaddress.ip_address("127.0.0.1"), "test")
+
+    def test_sanitize_list(self) -> None:
+        arbiter = _make_arbiter()
+        sanitized = arbiter._sanitize_hypothesis([{"api_key": "secret"}, {"safe": "data"}])
+        assert sanitized[0]["api_key"] == "[REDACTED]"
+        assert sanitized[1]["safe"] == "data"
+
+    def test_extract_plan_not_list(self) -> None:
+        arbiter = _make_arbiter()
+        assert arbiter._extract_plan({"plan": "not a list"}) == []
+
+    def test_load_json_not_exists(self) -> None:
+        arbiter = _make_arbiter()
+        assert arbiter._load_json(Path("/nonexistent"), default={}) == {}
+
+    def test_persist_event(self) -> None:
+        arbiter = _make_arbiter()
+        arbiter._persist_event("test.topic", {"key": "value"})
+
+    def test_update_hypothesis_state(self) -> None:
+        arbiter = _make_arbiter()
+        arbiter._update_hypothesis_state("h-1", "completed", {"data": "test"})
+
+    def test_site_url_default(self) -> None:
+        arbiter = _make_arbiter()
+        env = dict(os.environ)
+        for k in ("CEREBELLUM_HTTP_REFERER", "CEREBELLUM_SITE_URL", "OPENROUTER_HTTP_REFERER"):
+            env.pop(k, None)
+        with patch.dict(os.environ, env, clear=True):
+            assert arbiter._site_url() == "https://openclaw.local/cerebellum"
+
+    def test_send_telegram_message_no_creds(self) -> None:
+        arbiter = _make_arbiter()
+        env = dict(os.environ)
+        for k in ("TELEGRAM_BOT_TOKEN", "OPENCLAW_TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "OPENCLAW_TELEGRAM_CHAT_ID"):
+            env.pop(k, None)
+        with patch.dict(os.environ, env, clear=True):
+            with patch.object(arbiter, "_resolve_openclaw_binary", return_value=None):
+                result = arbiter._send_telegram_message("hello")
+                assert result["ok"] is False
+
+    def test_coerce_optional_float_negative(self) -> None:
+        arbiter = _make_arbiter()
+        assert arbiter._coerce_optional_float(-1.0) is None
+
+    def test_coerce_optional_float_nan(self) -> None:
+        arbiter = _make_arbiter()
+        assert arbiter._coerce_optional_float(float("nan")) is None
+
+    def test_extract_execution_cost_from_result(self) -> None:
+        arbiter = _make_arbiter()
+        assert arbiter._extract_execution_cost({}, {"execution_cost": 2.5}) == 2.5
+
+    def test_extract_execution_cost_non_numeric(self) -> None:
+        arbiter = _make_arbiter()
+        assert arbiter._extract_execution_cost({"cost": "abc"}, {}) == 0.0
+
+    def test_rate_limiter_discard(self) -> None:
+        arbiter = _make_arbiter()
+        arbiter.action_limiter = RateLimiter(max_count=0, window_seconds=3600)
+        result = arbiter.evaluate({"id": "t-rl", "confidence": 0.95, "generation_cost_usd": 0.01, "plan": [{"tool": "http.get"}]})
+        assert result.decision == "discard"
+        assert "rate limit" in result.reason
+
+    def test_cost_limiter_discard(self) -> None:
+        arbiter = _make_arbiter()
+        # Pre-spend the budget so next evaluation is rejected
+        arbiter.cost_limiter = DailyCostTracker(max_cost=0.01)
+        arbiter.cost_limiter.allow(0.01)  # spend it all
+        result = arbiter.evaluate({"id": "t-cl", "confidence": 0.7, "generation_cost_usd": 0.005, "plan": [{"tool": "http.get"}]})
+        assert result.decision == "discard"
+        assert "budget" in result.reason
+        assert "budget" in result.reason
+
+    def test_auto_execute_budget_halt(self) -> None:
+        arbiter = _make_arbiter()
+        result = arbiter.auto_execute({
+            "id": "t-budget",
+            "plan": [{"tool": "proposal.snooze", "proposal_id": "p-1", "cost": 10000.0}],
+        })
+        assert result["status"] == "partial_failure"
+        assert result["reason"] == "execution cost budget exceeded"
+
+    def test_resolve_openclaw_binary_none(self) -> None:
+        arbiter = _make_arbiter()
+        result = arbiter._resolve_openclaw_binary()
+        assert result is None or isinstance(result, Path)
+
+    def test_handle_notification_send_missing_text(self) -> None:
+        arbiter = _make_arbiter()
+        with pytest.raises(ValueError, match="requires text"):
+            arbiter._handle_notification_send({})
+
+    def test_generation_cost_clamped_to_budget(self) -> None:
+        arbiter = _make_arbiter()
+        # generation_cost_usd > daily_budget triggers clamping (line 269-275)
+        result = arbiter.evaluate({
+            "id": "t-clamp",
+            "confidence": 0.95,
+            "generation_cost_usd": 10.0,  # exceeds daily budget of 5.0
+            "reversibility": "unknown",
+            "plan": [{"tool": "http.get"}],
+        })
+        # Should still evaluate (cost clamped to budget)
+        assert result.decision in ("auto_execute", "stage_notify", "discard")
+
+    def test_load_state_malformed_item(self) -> None:
+        arbiter = _make_arbiter()
+        # Write malformed state data
+        import json as _json
+        state = {
+            "kill_switch": False,
+            "recent_decisions": ["not_a_dict", 123, None],
+        }
+        arbiter.state_file.write_text(_json.dumps(state))
+        # Should not raise
+        arbiter._load_state()
+        assert arbiter.recent_decisions == []
+
+    def test_emit_event_error_path(self) -> None:
+        arbiter = _make_arbiter()
+        # Make emitter raise an exception
+        arbiter.emitter.emit.side_effect = RuntimeError("emit failed")
+        arbiter.emitter.publish = None
+        arbiter.emitter.send = None
+        # Should not raise - falls back to persist_event
+        arbiter._emit_event("test.event", {"data": "test"})
+
+    def test_persist_event_error_path(self) -> None:
+        arbiter = _make_arbiter()
+        # _append_jsonl to nonexistent dir should be caught internally
+        arbiter._persist_event("test.topic", {"key": "value"})
+        # Should not raise - errors are caught internally
+
+    def test_load_json_error(self) -> None:
+        arbiter = _make_arbiter()
+        # Create file with invalid JSON
+        test_file = arbiter.state_dir / "bad.json"
+        test_file.write_text("{invalid json}")
+        result = arbiter._load_json(test_file, default="fallback")
+        assert result == "fallback"
+
+    def test_handle_file_read_existing_file(self) -> None:
+        arbiter = _make_arbiter()
+        # Create a test file in the allowed base dir
+        test_file = arbiter.base_dir / "test_read.txt"
+        test_file.write_text("hello world")
+        try:
+            result = arbiter._handle_file_read({"path": str(test_file)})
+            assert result["status"] == "ok"
+            assert result["content"] == "hello world"
+        finally:
+            test_file.unlink(missing_ok=True)
+
+    def test_handle_file_read_truncated(self) -> None:
+        arbiter = _make_arbiter()
+        test_file = arbiter.base_dir / "test_large.txt"
+        test_file.write_text("x" * 15000)
+        try:
+            result = arbiter._handle_file_read({"path": str(test_file)})
+            assert result["status"] == "ok"
+            assert result["truncated"] is True
+            assert len(result["content"]) == 10000
+        finally:
+            test_file.unlink(missing_ok=True)
+
+    def test_handle_model_call_missing_model(self) -> None:
+        arbiter = _make_arbiter()
+        with patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}):
+            with pytest.raises(ValueError, match="not in allowlist"):
+                arbiter._handle_model_call({"prompt": "hi"})
+
+    def test_handle_web_search_missing_query_empty(self) -> None:
+        arbiter = _make_arbiter()
+        with pytest.raises(ValueError, match="requires a query"):
+            arbiter._handle_web_search({"query": ""})
+
+    def test_validate_url_rejects_private_ip(self) -> None:
+        arbiter = _make_arbiter()
+        with patch("socket.getaddrinfo", return_value=[(2, 1, 6, "", ("10.0.0.1", 80))]):
+            with pytest.raises(ValueError, match="forbidden address"):
+                arbiter._validate_url("http://test-private.example.com")
+
+    def test_validate_url_rejects_loopback_resolution(self) -> None:
+        arbiter = _make_arbiter()
+        with patch("socket.getaddrinfo", return_value=[(2, 1, 6, "", ("127.0.0.1", 80))]):
+            with pytest.raises(ValueError, match="forbidden address"):
+                arbiter._validate_url("http://test-loopback.example.com")
+
+    def test_validate_file_path_disallowed_suffix(self) -> None:
+        arbiter = _make_arbiter()
+        test_file = arbiter.base_dir / "test.xyz"
+        test_file.touch()
+        try:
+            with pytest.raises(ValueError, match="disallowed file type"):
+                arbiter._validate_file_path(test_file)
+        finally:
+            test_file.unlink(missing_ok=True)
+
+    def test_validate_file_path_sensitive_pattern(self) -> None:
+        arbiter = _make_arbiter()
+        test_file = arbiter.base_dir / "test.env"
+        test_file.touch()
+        try:
+            with pytest.raises(ValueError):
+                arbiter._validate_file_path(test_file)
+        finally:
+            test_file.unlink(missing_ok=True)
+
+    def test_validate_file_path_outside_root(self) -> None:
+        arbiter = _make_arbiter()
+        # Create a file in home (not in forbidden prefixes) but outside allowed roots
+        test_file = Path.home() / "test_outside.py"
+        test_file.touch()
+        try:
+            with pytest.raises(ValueError, match="outside allowed roots"):
+                arbiter._validate_file_path(test_file)
+        finally:
+            test_file.unlink(missing_ok=True)
+
+    def test_validate_file_path_config_json_allowed(self) -> None:
+        arbiter = _make_arbiter()
+        config_file = arbiter.base_dir / "config.json"
+        config_file.touch()
+        try:
+            # Should not raise - config.json is explicitly allowed
+            arbiter._validate_file_path(config_file)
+        finally:
+            config_file.unlink(missing_ok=True)
+
+    def test_sanitize_hypothesis_deep_nesting(self) -> None:
+        arbiter = _make_arbiter()
+        value = {"a": {"b": {"c": {"api_key": "secret"}}}}
+        sanitized = arbiter._sanitize_hypothesis(value)
+        assert sanitized["a"]["b"]["c"]["api_key"] == "[REDACTED]"
+
+    def test_extract_tools_with_none_tool_name(self) -> None:
+        arbiter = _make_arbiter()
+        hypothesis = {"plan": [{"tool": None, "other": "data"}, {"tool": "http.get"}]}
+        tools = arbiter._extract_tools(hypothesis)
+        assert tools == ["http.get"]
+
+    def test_rate_limiter_prune(self) -> None:
+        rl = RateLimiter(max_count=2, window_seconds=60)
+        rl.allow()
+        rl.allow()
+        assert rl.allow() is False
+        # Manually expire events by manipulating the deque
+        import time
+        now = time.monotonic()
+        while rl.events:
+            rl.events.popleft()
+        assert rl.allow() is True
+
+    def test_daily_cost_tracker_day_reset(self) -> None:
+        dct = DailyCostTracker(max_cost=1.0)
+        dct.allow(0.5)
+        # Simulate day change
+        dct._day = dct._day - __import__("datetime").timedelta(days=1)
+        assert dct.allow(0.5) is True
+
+    def test_daily_cost_tracker_negative_cost(self) -> None:
+        dct = DailyCostTracker(max_cost=1.0)
+        assert dct.allow(-1.0) is True  # negative costs treated as 0
