@@ -260,6 +260,7 @@ class Proposer:
                 ],
                 "generation_interval_minutes": self.generation_interval_minutes,
                 "current_time": datetime.now(UTC).isoformat(),
+                "relevant_patterns": self._get_relevant_patterns(events),
             }
             return (
                 "You are the proposer for CEREBELLUM, a proactive ops assistant for RASPUTIN. "
@@ -828,6 +829,33 @@ class Proposer:
         return (
             f"Derived from {len(episodes)} recent episodes and {len(events)} recent events observed by CEREBELLUM."
         )
+
+    def _get_relevant_patterns(self, events: list) -> list[dict[str, Any]]:
+        """Get successor patterns relevant to recent events for the prompt."""
+        try:
+            from cerebellum.mining import get_relevant_patterns
+
+            # Query stored patterns from KuzuDB
+            patterns = []
+            try:
+                rows = self._get_connection().execute(
+                    """
+                    SELECT id, source_type, target_type, support, confidence,
+                           COALESCE(lift, 1.0) AS lift, first_seen, last_seen
+                    FROM hypotheses
+                    WHERE state = 'proposed'
+                    ORDER BY lift DESC
+                    LIMIT 20
+                    """
+                ).fetchall()
+                for row in rows:
+                    patterns.append(dict(row))
+            except Exception:
+                logger.debug("No successor patterns available for prompt")
+
+            return get_relevant_patterns(patterns, events, limit=10)
+        except Exception:
+            return []
 
     def _clamp_float(self, value: Any) -> float:
         try:

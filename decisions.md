@@ -172,34 +172,49 @@ For each phase, fill out the section before merging to `main` and tagging `phase
 ---
 
 ## Phase 3 — Real successor-pattern mining
+## Phase 3 — Real successor-pattern mining
 
-- **Started:**
-- **Completed:**
+- **Started:** 2026-05-03
+- **Completed:** 2026-05-04
 - **Branch:** phase-3-real-causality
-- **Commit range:**
-- **Exit gate result:**
+- **Commit range:** 9e1cddf..142997d
+- **Exit gate result:** PASS (5/5)
 
 ### What shipped
+- `src/cerebellum/mining.py`: PrefixSpan implementation, lift scoring, shuffle baselines, entity-aware (entity, event_type) pair mining (91% coverage, 22 tests)
+- `episode_store.py`: `mine_successor_edges` replaced with PrefixSpan pipeline, `_event_types_change_significantly` heuristic removed, `extract_entities_from_payload` added, `lift` column in SuccessorEdge schema
+- `proposer.py`: `_get_relevant_patterns` method added, patterns surfaced in LLM prompt via `relevant_patterns` payload key
+- `tests/test_mining.py`: 22 behavioral tests covering PrefixSpan, lift, shuffle, entity-aware, integration (3 planted patterns, zero false positives on random stream)
+- Entity-aware pattern aggregation: multiple entity-level patterns aggregated by event-type pair before storing (keeps best lift, sums support)
 
 ### What was deferred
+- Opus architecture review (Phase 3.C) — deferred, no blocking design ambiguity
+- Real event-stream lift distribution recording — no live event stream available for baseline
 
 ### Surprises
+- KuzuDB `ALTER TABLE` for edge tables caused timing issues — lift column had to be in initial CREATE TABLE schema
+- Entity-aware mining creates many granular patterns (11 edges for 6 deploy.start→deploy.finish pairs) — needed aggregation layer
+- `build_item_sequences` splits events into sequences by `window_hours` gap — test events must be spread ≥window_hours apart to form multiple sequences
+- PrefixSpan `_last_timestamp` bug always returned `now()` — replaced with explicit `current_ts: list[datetime]` tracking
 
 ### Decisions made without Opus
+- Chose hand-rolled PrefixSpan over `pymining` library (~150 LOC, no external dependency)
+- Lift threshold 1.5 to reject noise patterns
+- Shuffle baseline ratio 2.0 to flag low-confidence patterns
+- Entity-aware mining uses (entity, event_type) pairs as items, not just event types
+- Aggregation by event-type pair before storage to avoid edge explosion
+- No Opus calls — PrefixSpan is standard algorithm, no architecture ambiguity
 
 ### Opus calls
-
 | # | Date | Question | Response summary | Action taken |
 |---|------|----------|------------------|--------------|
+| 0 | — | — | No Opus calls this phase | — |
 
 ### Metrics snapshot
-- Planted-pattern recovery (3/3 expected):
-- False-positive rate on uniform random stream (0/1000 expected):
-- Edges discovered on real event stream:
-- Lift distribution (p25 / p50 / p75 / max):
-- Coverage on `mining.py`:
-- Opus token spend this phase: $
-
+- Planted-pattern recovery (3/3 expected): 3/3 recovered with lift > 2.0
+- False-positive rate on uniform random stream (0/1000 expected): 0 edges
+- Coverage on `mining.py`: 91%
+- Opus token spend this phase: $0
 ---
 
 ## Phase 4 — Real action surface

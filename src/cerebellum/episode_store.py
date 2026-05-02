@@ -18,6 +18,9 @@ from typing import Any
 import kuzu
 
 from cerebellum.http_safe import _safe_opener
+from cerebellum.mining import (
+    mine_patterns,
+)
 
 logger = logging.getLogger(__name__)
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -184,10 +187,13 @@ class EpisodeStore:
         return episode_id
 
     def mine_successor_edges(self, window_hours: int = 168) -> list[dict[str, Any]]:
-        """Mine successor patterns from recent events within a time window."""
+        """Mine successor patterns using PrefixSpan with lift scoring.
+
+        Replaces naive event-type co-occurrence with entity-aware sequential
+        pattern mining. Patterns with lift < 1.5 are rejected as noise.
+        """
         logger.info("Starting successor mining for %d hours", window_hours)
         since = (datetime.now(UTC) - timedelta(hours=window_hours)).isoformat()
-        discovered: list[dict[str, Any]] = []
 
         try:
             rows = self._fetch_all_read_only(
@@ -210,47 +216,56 @@ class EpisodeStore:
         if len(rows) < 2:
             return []
 
-        parsed_rows = []
+        # Cap to 500 events for mining performance
+        if len(rows) > 500:
+            logger.warning("Successor mining capped to 500 events (had %d)", len(rows))
+            rows = rows[:500]
+
+        # Enrich events with entities
+        events = []
         for row in rows:
-            try:
-                parsed_rows.append(
-                    {
-                        **row,
-                        "dt": self._parse_timestamp(str(row["timestamp"])),
-                    }
-                )
-            except Exception as exc:
-                logger.debug("Skipping unparsable event row during successor mining: %s", exc)
+            event = dict(row)
+            payload = event.get("payload")
+            if isinstance(payload, str):
+                try:
+                    payload = json.loads(payload)
+                    event["payload"] = payload
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            # Extract entities from payload
+            event["entities"] = self.extract_entities_from_payload(event)
+            events.append(event)
 
-        if len(parsed_rows) > 500:
-            logger.warning("Successor mining capped to 500 events (had %d)", len(parsed_rows))
-            parsed_rows = parsed_rows[:500]
+        # Mine patterns using PrefixSpan + lift
+        patterns = mine_patterns(
+            events,
+            min_support=5,
+            min_length=2,
+            max_length=4,
+            window_hours=1.0,
+            lift_threshold=1.5,
+        )
 
-        support_counts: Counter[tuple[str, str]] = Counter()
-        source_counts: Counter[str] = Counter()
-        one_hour = timedelta(hours=1)
 
-        for index, current in enumerate(parsed_rows):
-            source_type = str(current["type"])
-            source_counts[source_type] += 1
-            for follower in parsed_rows[index + 1 : index + 51]:
-                delta = follower["dt"] - current["dt"]
-                if delta <= timedelta(0):
-                    continue
-                if delta > one_hour:
-                    break
-                follower_type = str(follower["type"])
-                if self._event_types_change_significantly(source_type, follower_type):
-                    break
-                support_counts[(source_type, follower_type)] += 1
+        if not patterns:
+            logger.info("No successor patterns found above lift threshold")
+            return []
 
-        for (source_type, target_type), support in support_counts.items():
-            if support < 5:
-                continue
+        # Aggregate by event-type pair, keeping best lift + summing support
+        aggregated: dict[tuple[str, str], SuccessorPattern] = {}
+        for pattern in patterns:
+            key = (pattern.source.event_type, pattern.target.event_type)
+            if key not in aggregated or pattern.lift > aggregated[key].lift:
+                aggregated[key] = pattern
+            else:
+                aggregated[key].support += pattern.support
 
-            confidence = round(support / max(source_counts[source_type], 1), 4)
-            edge_id = f"successor:{hashlib.sha1(f'{source_type}->{target_type}'.encode()).hexdigest()[:16]}"
-            timestamp = datetime.now(UTC).isoformat()
+        timestamp = datetime.now(UTC).isoformat()
+        discovered: list[dict[str, Any]] = []
+
+        for (source_type, target_type), pattern in aggregated.items():
+            edge_str = f"{source_type}->{target_type}"
+            edge_id = f"successor:{hashlib.sha1(edge_str.encode()).hexdigest()[:16]}"
 
             try:
                 with self._write_lock:
@@ -261,38 +276,22 @@ class EpisodeStore:
                             edge.target_type = $target_type,
                             edge.support = $support,
                             edge.confidence = $confidence,
+                            edge.lift = $lift,
                             edge.first_seen = COALESCE(edge.first_seen, $timestamp),
                             edge.last_seen = $timestamp
-                        """,
+                            """,
                         {
                             "id": edge_id,
                             "source_type": source_type,
                             "target_type": target_type,
-                            "support": int(support),
-                            "confidence": float(confidence),
+                            "support": int(pattern.support),
+                            "confidence": float(pattern.confidence),
+                            "lift": float(pattern.lift),
                             "timestamp": timestamp,
                         },
                     )
-
-                    # Store target entity ID as edge property (Kuzu 0.7.1 lacks relation tables)
-                    target_entity = {
-                        "name": target_type,
-                        "type": "service",
-                        "description": f"Event type target for successor pattern {source_type} -> {target_type}",
-                    }
-                    self._upsert_entity(target_entity, timestamp)
-                    self._run(
-                        """
-                        MATCH (edge:SuccessorEdge {id: $edge_id})
-                        SET edge.target_entity_id = $entity_id
-                        """,
-                        {
-                            "edge_id": edge_id,
-                            "entity_id": self._entity_id(target_entity["type"], target_entity["name"]),
-                        },
-                    )
             except Exception as exc:
-                logger.error("Failed to persist successor edge %s -> %s: %s", source_type, target_type, exc)
+                logger.error("Failed to persist successor edge %s: %s", edge_id, exc)
                 continue
 
             discovered.append(
@@ -300,11 +299,13 @@ class EpisodeStore:
                     "id": edge_id,
                     "source_type": source_type,
                     "target_type": target_type,
-                    "support": int(support),
-                    "confidence": float(confidence),
+                    "support": int(pattern.support),
+                    "confidence": float(pattern.confidence),
+                    "lift": float(pattern.lift),
                 }
             )
 
+        logger.info("Discovered %d successor patterns", len(discovered))
         return discovered
 
     def query(self, natural_language: str) -> dict[str, Any]:
@@ -420,6 +421,20 @@ class EpisodeStore:
 
         return entities
 
+    def extract_entities_from_payload(self, event: dict[str, Any]) -> list[dict[str, str]]:
+        """Extract entities from a full event dict (payload + top-level fields)."""
+        payload = event.get("payload") or {}
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except (json.JSONDecodeError, TypeError):
+                payload = {}
+        # Also check top-level actor field
+        actor = str(event.get("actor", "")).strip()
+        if actor and actor not in (str(v) for v in payload.values()):
+            payload = dict(payload)
+            payload["actor"] = actor
+        return self.extract_entities(payload)
     @staticmethod
     def _load_config(config_path: Path) -> dict[str, Any]:
         try:
@@ -472,7 +487,8 @@ class EpisodeStore:
                 confidence FLOAT,
                 first_seen STRING,
                 last_seen STRING,
-                target_entity_id STRING
+                target_entity_id STRING,
+                lift FLOAT DEFAULT 1.0
             );
             """,
         ]
@@ -483,6 +499,11 @@ class EpisodeStore:
             except Exception as exc:
                 logger.debug("Schema query may already exist: %s", exc)
 
+        # Add lift column if missing (Phase 3 migration)
+        try:
+            self._run("ALTER TABLE SuccessorEdge ADD COLUMN lift FLOAT")
+        except Exception as exc:
+            logger.debug("Lift column migration skipped: %s", exc)
         # NOTE: Kuzu 0.7.1 does not support CREATE RELATION TABLE.
         # Relationships are stored via node properties instead of graph edges.
 
@@ -690,13 +711,6 @@ User request: {natural_language}
         except Exception as exc:
             logger.warning("Failed to generate NL query via LLM: %s", exc)
             return None
-
-    def _event_types_change_significantly(self, source_type: str, follower_type: str) -> bool:
-        source_tokens = {token for token in re.split(r"[^a-z0-9]+", source_type.lower()) if token}
-        follower_tokens = {token for token in re.split(r"[^a-z0-9]+", follower_type.lower()) if token}
-        if not source_tokens or not follower_tokens:
-            return False
-        return source_tokens.isdisjoint(follower_tokens)
 
     def _call_llm(self, prompt: str) -> LLMResponse:
         if not self.openrouter_api_key:
