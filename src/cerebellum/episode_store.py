@@ -246,17 +246,26 @@ class EpisodeStore:
             lift_threshold=1.5,
         )
 
+
         if not patterns:
             logger.info("No successor patterns found above lift threshold")
             return []
 
-        discovered: list[dict[str, Any]] = []
-        timestamp = datetime.now(UTC).isoformat()
-
+        # Aggregate by event-type pair, keeping best lift + summing support
+        aggregated: dict[tuple[str, str], SuccessorPattern] = {}
         for pattern in patterns:
-            source_type = pattern.source.event_type
-            target_type = pattern.target.event_type
-            edge_id = pattern.id
+            key = (pattern.source.event_type, pattern.target.event_type)
+            if key not in aggregated or pattern.lift > aggregated[key].lift:
+                aggregated[key] = pattern
+            else:
+                aggregated[key].support += pattern.support
+
+        timestamp = datetime.now(UTC).isoformat()
+        discovered: list[dict[str, Any]] = []
+
+        for (source_type, target_type), pattern in aggregated.items():
+            edge_str = f"{source_type}->{target_type}"
+            edge_id = f"successor:{hashlib.sha1(edge_str.encode()).hexdigest()[:16]}"
 
             try:
                 with self._write_lock:
@@ -478,7 +487,8 @@ class EpisodeStore:
                 confidence FLOAT,
                 first_seen STRING,
                 last_seen STRING,
-                target_entity_id STRING
+                target_entity_id STRING,
+                lift FLOAT DEFAULT 1.0
             );
             """,
         ]
