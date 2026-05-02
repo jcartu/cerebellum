@@ -7,7 +7,7 @@ import sqlite3
 import threading
 import time
 import uuid
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -43,6 +43,8 @@ class Hypothesis:
     context_summary: str
     state: str
     metadata: dict[str, Any]
+    evidence_event_ids: list[str] = field(default_factory=list)
+    causal_argument: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -74,6 +76,8 @@ class Proposer:
         "plan",
         "tools_required",
         "context_summary",
+        "evidence_event_ids",
+        "causal_argument",
         "metadata",
     }
 
@@ -97,8 +101,14 @@ class Proposer:
         self._checkpoint_interval_seconds = 300
         self._checkpoint_stop = threading.Event()
         self._checkpoint_thread: threading.Thread | None = None
+        self._daily_proposal_count = 0
+        self._daily_proposal_count_day = datetime.now(UTC).date().isoformat()
+        self._proposal_cap = 50
+        self._pause_hours = 12
+        self._last_cap_triggered: datetime | None = None
         self._client = self._build_client()
         self._init_db()
+        self._daily_proposal_count = self._count_proposals_for_day(self._daily_proposal_count_day)
 
     def _load_config(self) -> dict[str, Any]:
         try:
@@ -160,6 +170,8 @@ class Proposer:
                       plan TEXT,
                       tools_required TEXT,
                       context_summary TEXT,
+                      evidence_event_ids TEXT,
+                      causal_argument TEXT,
                       state TEXT DEFAULT 'proposed',
                       metadata TEXT,
                       created_at TEXT DEFAULT (datetime('now')),
@@ -182,6 +194,8 @@ class Proposer:
     def generate_hypotheses(self) -> list[Hypothesis]:
         """Main method: generate hypotheses from current state."""
         try:
+            if not self._can_generate_hypotheses():
+                return []
             episodes = self._get_recent_episodes(hours=2)
             events = self._get_recent_events(minutes=30)
             existing = self.get_active_hypotheses(state="proposed", limit=25)
@@ -191,15 +205,28 @@ class Proposer:
                 return []
 
             stored: list[Hypothesis] = []
+            remaining_slots = self._remaining_daily_proposal_slots()
+            if remaining_slots <= 0:
+                self._trigger_proposal_cap_if_needed()
+                return []
             for item in raw_hypotheses:
+                if remaining_slots <= 0:
+                    self._trigger_proposal_cap_if_needed()
+                    logger.info("Skipping remaining hypotheses: daily proposal cap reached")
+                    break
                 hypothesis = self._coerce_hypothesis(item, episodes=episodes, events=events, usage=usage)
                 if hypothesis is None:
+                    continue
+                if not hypothesis.evidence_event_ids or not hypothesis.causal_argument.strip():
+                    logger.info("Rejecting hypothesis candidate as ungrounded: title=%s reason=ungrounded", hypothesis.title)
                     continue
                 if self._is_duplicate(hypothesis, existing + [entry.to_dict() for entry in stored]):
                     logger.info("Skipping duplicate hypothesis candidate: %s", hypothesis.title)
                     continue
                 if self._store_hypothesis(hypothesis):
                     stored.append(hypothesis)
+                    remaining_slots -= 1
+                    self._record_generated_proposals(1)
                     self._emit_event(
                         "cerebellum.hypothesis",
                         {
@@ -208,6 +235,7 @@ class Proposer:
                             "title": hypothesis.title,
                             "confidence": hypothesis.confidence,
                             "utility": hypothesis.utility,
+                            "evidence_event_ids": hypothesis.evidence_event_ids,
                         },
                     )
             return stored
@@ -239,18 +267,20 @@ class Proposer:
                 "Rules:\n"
                 "1. Return ONLY valid JSON. No markdown, no prose, no code fences.\n"
                 "2. The JSON must be an array of 0 to 5 objects.\n"
-                "3. Every object must include exactly these keys: title, description, confidence, utility, cost, reversibility, plan, tools_required, context_summary, metadata.\n"
+                "3. Every object must include exactly these keys: title, description, confidence, utility, cost, reversibility, plan, tools_required, context_summary, evidence_event_ids, causal_argument, metadata.\n"
+                "3a. evidence_event_ids must reference 1 to 5 event IDs from recent_events. causal_argument must be 1 to 2 sentences explaining why those specific events imply the proposed action.\n"
                 "4. confidence, utility, and cost must be calibrated floats between 0.0 and 1.0. Avoid inflated confidence.\n"
                 "5. reversibility must be one of: full, partial, none.\n"
                 "6. plan must be a concrete ordered array of short executable steps, not vague intentions.\n"
                 "7. tools_required must name real tools, systems, or capabilities needed to execute the plan.\n"
                 "8. context_summary must concisely explain the evidence that triggered the hypothesis.\n"
                 "9. metadata must be a JSON object with optional supporting details such as observed_patterns, risk_level, or estimated_minutes.\n"
-                "10. Only generate SPECIFIC and ACTIONABLE hypotheses with plausible user value in the next hour to day.\n"
-                "11. Avoid duplicates or near-duplicates of existing hypotheses, especially these titles: "
+                "10. causal_argument must not use vague language; reference specific event types, IDs, or payload values from the supplied context.\n"
+                "11. Only generate SPECIFIC and ACTIONABLE hypotheses with plausible user value in the next hour to day.\n"
+                "12. Avoid duplicates or near-duplicates of existing hypotheses, especially these titles: "
                 f"{existing_titles or ['none']}.\n"
-                "12. Prefer hypotheses that either unblock ongoing work, surface hidden risk, or capitalize on clear opportunities.\n"
-                "13. If the context is too weak, return an empty array.\n\n"
+                "13. Prefer hypotheses that either unblock ongoing work, surface hidden risk, or capitalize on clear opportunities.\n"
+                "14. If the context is too weak, return an empty array.\n\n"
                 "Context JSON:\n"
                 f"{json.dumps(payload, ensure_ascii=False, indent=2)}"
             )
@@ -313,6 +343,10 @@ class Proposer:
             conn.execute("ALTER TABLE hypotheses ADD COLUMN generation_cost_usd REAL")
         if "estimated_execution_cost_usd" not in columns:
             conn.execute("ALTER TABLE hypotheses ADD COLUMN estimated_execution_cost_usd REAL")
+        if "evidence_event_ids" not in columns:
+            conn.execute("ALTER TABLE hypotheses ADD COLUMN evidence_event_ids TEXT")
+        if "causal_argument" not in columns:
+            conn.execute("ALTER TABLE hypotheses ADD COLUMN causal_argument TEXT DEFAULT ''")
         if "cost" in columns:
             conn.execute(
                 """
@@ -390,6 +424,8 @@ class Proposer:
             if not isinstance(item, dict):
                 logger.error("Rejecting non-object hypothesis from model %s: %r", model, item)
                 return None
+            item.setdefault("evidence_event_ids", [])
+            item.setdefault("causal_argument", "")
             missing_keys = self.EXPECTED_HYPOTHESIS_KEYS.difference(item)
             if missing_keys:
                 logger.error(
@@ -403,6 +439,12 @@ class Proposer:
                 return None
             if not isinstance(item.get("tools_required"), list):
                 logger.error("Rejecting malformed hypothesis from model %s: tools_required must be a list", model)
+                return None
+            if not isinstance(item.get("evidence_event_ids"), list):
+                logger.error("Rejecting malformed hypothesis from model %s: evidence_event_ids must be a list", model)
+                return None
+            if not isinstance(item.get("causal_argument"), str):
+                logger.error("Rejecting malformed hypothesis from model %s: causal_argument must be a string", model)
                 return None
             if not isinstance(item.get("metadata"), dict):
                 logger.error("Rejecting malformed hypothesis from model %s: metadata must be an object", model)
@@ -693,6 +735,11 @@ class Proposer:
             tools_required = [
                 str(tool).strip() for tool in item.get("tools_required", []) if str(tool).strip()
             ]
+            evidence_event_ids = [
+                str(event_id).strip() for event_id in item.get("evidence_event_ids", []) if str(event_id).strip()
+            ]
+            evidence_event_ids = list(dict.fromkeys(evidence_event_ids))[:5]
+            causal_argument = str(item.get("causal_argument", "")).strip()
             if not title or not description or not plan:
                 raise ValueError("Hypothesis missing required content")
             reversibility = str(item.get("reversibility", "partial")).strip().lower()
@@ -734,6 +781,8 @@ class Proposer:
                 plan=plan,
                 tools_required=tools_required,
                 context_summary=context_summary,
+                evidence_event_ids=evidence_event_ids,
+                causal_argument=causal_argument,
                 state="proposed",
                 metadata=metadata,
             )
@@ -793,20 +842,86 @@ class Proposer:
         hypothesis whose title happened to be a common phrase.
         """
         candidate_title = hypothesis.title.strip().lower()
-        if not candidate_title:
-            return False
         candidate_tokens = self._tokenize_for_dedup(candidate_title)
+        candidate_evidence = {event_id for event_id in hypothesis.evidence_event_ids if event_id}
 
         for item in existing:
             existing_title = str(item.get("title", "")).strip().lower()
-            if not existing_title:
-                continue
-            if existing_title == candidate_title:
+            existing_evidence = {
+                str(event_id).strip()
+                for event_id in item.get("evidence_event_ids", [])
+                if str(event_id).strip()
+            }
+            titles_match = bool(candidate_title and existing_title and existing_title == candidate_title)
+            similar_action = False
+            if candidate_tokens and existing_title:
+                existing_tokens = self._tokenize_for_dedup(existing_title)
+                similar_action = self._jaccard(candidate_tokens, existing_tokens) > 0.8
+            if titles_match:
                 return True
-            existing_tokens = self._tokenize_for_dedup(existing_title)
-            if self._jaccard(candidate_tokens, existing_tokens) > 0.8:
+            if similar_action:
+                return True
+            if candidate_evidence and existing_evidence and candidate_evidence.issubset(existing_evidence):
                 return True
         return False
+
+    def _count_proposals_for_day(self, day_iso: str) -> int:
+        day_start = datetime.fromisoformat(f"{day_iso}T00:00:00+00:00")
+        day_end = day_start + timedelta(days=1)
+        with self._db_lock:
+            conn = self._get_connection()
+            row = conn.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM hypotheses
+                WHERE state = 'proposed' AND timestamp >= ? AND timestamp < ?
+                """,
+                (day_start.isoformat(), day_end.isoformat()),
+            ).fetchone()
+        return int((row["count"] if row else 0) or 0)
+
+    def _refresh_daily_proposal_count(self) -> None:
+        today = datetime.now(UTC).date().isoformat()
+        if self._daily_proposal_count_day != today:
+            self._daily_proposal_count_day = today
+            self._daily_proposal_count = self._count_proposals_for_day(today)
+            self._last_cap_triggered = None
+
+    def _remaining_daily_proposal_slots(self) -> int:
+        self._refresh_daily_proposal_count()
+        return max(0, self._proposal_cap - self._daily_proposal_count)
+
+    def _trigger_proposal_cap_if_needed(self) -> None:
+        self._refresh_daily_proposal_count()
+        if self._daily_proposal_count >= self._proposal_cap and self._last_cap_triggered is None:
+            self._last_cap_triggered = datetime.now(UTC)
+            logger.warning(
+                "Proposal cap reached: daily_count=%s cap=%s pause_hours=%s",
+                self._daily_proposal_count,
+                self._proposal_cap,
+                self._pause_hours,
+            )
+
+    def _can_generate_hypotheses(self) -> bool:
+        self._refresh_daily_proposal_count()
+        if self._last_cap_triggered is not None:
+            paused_until = self._last_cap_triggered + timedelta(hours=self._pause_hours)
+            if datetime.now(UTC) < paused_until:
+                logger.info("Proposer paused until %s after hitting daily proposal cap", paused_until.isoformat())
+                return False
+            self._last_cap_triggered = None
+        if self._daily_proposal_count >= self._proposal_cap:
+            self._trigger_proposal_cap_if_needed()
+            return False
+        return True
+
+    def _record_generated_proposals(self, count: int) -> None:
+        if count <= 0:
+            return
+        self._refresh_daily_proposal_count()
+        self._daily_proposal_count += count
+        if self._daily_proposal_count >= self._proposal_cap:
+            self._trigger_proposal_cap_if_needed()
 
     @staticmethod
     def _tokenize_for_dedup(text: str) -> set[str]:
@@ -831,8 +946,9 @@ class Proposer:
                     INSERT INTO hypotheses (
                         id, timestamp, title, description, confidence, utility,
                         generation_cost_usd, estimated_execution_cost_usd,
-                        reversibility, plan, tools_required, context_summary, state, metadata
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        reversibility, plan, tools_required, context_summary,
+                        evidence_event_ids, causal_argument, state, metadata
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         hypothesis.id,
@@ -847,6 +963,8 @@ class Proposer:
                         json.dumps(hypothesis.plan, ensure_ascii=False),
                         json.dumps(hypothesis.tools_required, ensure_ascii=False),
                         hypothesis.context_summary,
+                        json.dumps(hypothesis.evidence_event_ids, ensure_ascii=False),
+                        hypothesis.causal_argument,
                         hypothesis.state,
                         json.dumps(hypothesis.metadata, ensure_ascii=False),
                     ),
@@ -866,6 +984,8 @@ class Proposer:
         result.pop("cost", None)
         result["plan"] = self._parse_json_column(result.get("plan"), [])
         result["tools_required"] = self._parse_json_column(result.get("tools_required"), [])
+        result["evidence_event_ids"] = self._parse_json_column(result.get("evidence_event_ids"), [])
+        result["causal_argument"] = str(result.get("causal_argument") or "")
         result["metadata"] = self._parse_json_column(result.get("metadata"), {})
         return result
 
