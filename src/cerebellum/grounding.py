@@ -3,9 +3,11 @@ from __future__ import annotations
 import json
 import logging
 import os
+import sqlite3 as sqlite3_mod
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -53,6 +55,13 @@ class GroundingVerifier:
         ).strip() or self.DEFAULT_VERIFIER_MODEL
         self.app_name = str(self.config.get("app_name", "CEREBELLUM")).strip() or "CEREBELLUM"
         self.site_url = str(self.config.get("site_url", "")).strip() or "https://localhost/cerebellum"
+
+        # Verifier metrics DB
+        metrics_db_path = Path(self.config.get("hippocampus", {}).get("graph_path", ".")).expanduser()
+        metrics_db_path = metrics_db_path.parent / "metrics.db"
+        self._metrics_db_path = metrics_db_path
+        self._metrics_db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._init_metrics_db()
 
     def verify_evidence_exists(
         self, proposal: dict[str, Any], context_event_ids: set[str]
@@ -152,8 +161,11 @@ class GroundingVerifier:
                 "Skipping causal grounding check for proposal %s because evidence verification failed",
                 evidence_result.proposal_id,
             )
+            self.record_verification(evidence_result.verified)
             return evidence_result
-        return self.verify_causal_argument(proposal, events)
+        result = self.verify_causal_argument(proposal, events)
+        self.record_verification(result.verified)
+        return result
 
     def _load_config(self) -> dict[str, Any]:
         """Load verifier configuration from disk.
@@ -329,3 +341,81 @@ class GroundingVerifier:
         if not isinstance(value, list):
             return []
         return [str(item) for item in value]
+
+    def _init_metrics_db(self) -> None:
+        """Initialize the verifier metrics SQLite database.
+
+        Args:
+            None.
+
+        Returns:
+            None.
+        """
+        try:
+            conn = sqlite3_mod.connect(self._metrics_db_path)
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS verifier_metrics (
+                    date TEXT PRIMARY KEY,
+                    total_verifications INTEGER NOT NULL DEFAULT 0,
+                    disagreements INTEGER NOT NULL DEFAULT 0
+                )
+                """
+            )
+            conn.commit()
+            conn.close()
+        except Exception as exc:
+            logger.warning("Failed to init metrics DB: %s", exc)
+
+    def record_verification(self, verified: bool) -> None:
+        """Record a verification result in the metrics database.
+
+        Args:
+            verified: Whether the proposal passed verification.
+
+        Returns:
+            None.
+        """
+        try:
+            today = datetime.now(UTC).strftime("%Y-%m-%d")
+            conn = sqlite3_mod.connect(self._metrics_db_path)
+            conn.execute(
+                """
+                INSERT INTO verifier_metrics (date, total_verifications, disagreements)
+                VALUES (?, 1, ?)
+                ON CONFLICT(date) DO UPDATE SET
+                    total_verifications = total_verifications + 1,
+                    disagreements = disagreements + ?
+                """,
+                (today, int(not verified), int(not verified)),
+            )
+            conn.commit()
+            conn.close()
+        except Exception as exc:
+            logger.warning("Failed to record verification metric: %s", exc)
+
+    def get_disagreement_rate(self, days: int = 7) -> float:
+        """Get the verifier disagreement rate over the last N days.
+
+        Args:
+            days: Number of days to look back (default 7).
+
+        Returns:
+            Disagreement rate (0.0 to 1.0), or 0.0 if no data.
+        """
+        try:
+            conn = sqlite3_mod.connect(self._metrics_db_path)
+            row = conn.execute(
+                """
+                SELECT SUM(total_verifications), SUM(disagreements)
+                FROM verifier_metrics
+                WHERE date >= date('now', ?)
+                """,
+                (f"-{days} days",),
+            ).fetchone()
+            conn.close()
+            if row and row[0] and row[0] > 0:
+                return round(row[1] / row[0], 4)
+        except Exception as exc:
+            logger.warning("Failed to get disagreement rate: %s", exc)
+        return 0.0
