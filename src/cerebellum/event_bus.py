@@ -308,6 +308,11 @@ class EventBus:
                     await self._js.add_stream(
                         name="CEREBELLUM_EVENTS", subjects=["cerebellum.events.>"]
                     )
+                if not tls_enabled:
+                    logger.warning(
+                        "NATS connected WITHOUT TLS — traffic is unencrypted. "
+                        "Enable TLS in config or set CEREBELLUM_NATS_TLS_CA for production."
+                    )
                 self._nats_ready = True
                 logger.info(
                     "Connected to NATS JetStream at %s (attempt %d, tls=%s)", servers[0], attempt + 1, tls_enabled
