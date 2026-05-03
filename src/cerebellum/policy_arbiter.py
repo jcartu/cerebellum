@@ -1,7 +1,6 @@
 """Policy-driven action arbiter for evaluating and executing hypotheses."""
 
 import fnmatch
-import ipaddress
 import json
 import logging
 import math
@@ -67,6 +66,8 @@ SENSITIVE_HYPOTHESIS_FIELD_TOKENS = (
     "credential",
     "credentials",
 )
+
+MAX_RESPONSE_BYTES = 8 * 1024 * 1024  # 8 MiB hard cap per handler response
 
 
 @dataclass
@@ -841,13 +842,6 @@ class PolicyArbiter:
         safe_ip, host_header = self._validate_url(url)
 
         parsed = urllib.parse.urlparse(url)
-        # Rebuild netloc using the validated IP; preserve port if present.
-        if parsed.port is not None:
-            new_netloc = f"{safe_ip}:{parsed.port}"
-        else:
-            new_netloc = safe_ip
-        rebuilt = parsed._replace(netloc=new_netloc).geturl()
-
         # Use http_client with IP pinning for SSRF protection
         response = safe_request(
             "GET", url,
