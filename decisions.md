@@ -447,3 +447,31 @@ This list is what goes in the README's "Limitations" section in Phase 1 and gets
 ### Opus spend
 - Opus token spend this phase: ~$1 (1 OpenRouter call, claude-opus-4.7)
 - **Total Opus token spend across rebuild: ~$1**
+
+
+## Phase 6 Final Cleanup
+- **Started:** 2026-05-03
+- **Completed:** 2026-05-03
+- **Branch:** phase-6-final-cleanup
+- **Commit range:** 11be3b4..HEAD
+- **Tag:** phase-6-final-complete (pending)
+- **Opus calls:** 0
+- **Opus spend:** $0
+
+### What was done
+
+1. **urllib migration** — Migrated all `urllib.request` usage outside `http_safe.py`/`http_client.py` to `http_client.safe_get`/`safe_post`/`safe_post_bytes`/`safe_request`. Affected: `policy_arbiter.py` (6 handlers), `dashboard.py` (Telegram callbacks), `episode_store.py` (OpenRouter Cypher gen), `grounding.py` (OpenRouter verifier). Removed `_PinnedHTTPSConnection`, `_PinnedHTTPSHandler`, `_safe_opener` from policy_arbiter. Added `safe_post_bytes()` and `safe_request(pin_to_ip=...)` to http_client for SSRF protection.
+2. **episode_store coverage boost** — 69% → 81% via 46 new tests in `test_episode_store_coverage.py`. Covers `_call_llm`, `_read_nested_key`, `_extract_json_object`, `_is_safe_read_query`, `_generate_query_from_nl`, `_strip_query_comments`, `_fetch_all_read_only`, `query()`, `_normalize_event`, `get_recent_episodes()`, `_heuristic_query()`.
+3. **NATS TLS startup warning** — Added WARNING log when EventBus connects to NATS without TLS enabled. Test verifies warning appears when `tls=False` and is absent when `tls=True`.
+4. **Gate check 15** — Added urllib migration verification to `scripts/gates/phase_6.sh` (grep for `urllib.request` outside allowed files).
+5. **Lint fixes** — Restored `MAX_RESPONSE_BYTES` constant lost during migration, removed dead `rebuilt`/`new_netloc` code, sorted imports, cleaned test file imports.
+
+### Exit gate results
+- 15/15 checks PASSED
+- 663 tests passing (14 property tests, 10k fuzzer, 27 cypher regressions)
+- Global coverage: 84%, Arbiter: 84%, Dashboard: 77%, episode_store: 81%
+- mypy strict: 0 errors across 18 source files
+- ruff: clean across src/ and tests/
+
+### Opus spend
+- **Total Opus token spend across rebuild: ~$1** (unchanged)
