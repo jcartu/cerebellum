@@ -22,12 +22,13 @@ classifiers = [
 dependencies = [
   "nats-py>=2.7,<3",
   "kuzu>=0.6,<0.8",
-  "fastapi>=0.110,<0.120",
+  "fastapi>=0.115,<0.137",
   "uvicorn[standard]>=0.27,<0.40",
   "openai>=1.40,<2",            # OpenRouter-compatible client
   "pyyaml>=6,<7",
   "httpx>=0.27,<0.30",
   "pydantic>=2.7,<3",
+  "mcp>=1.0,<2",  # Anthropic's official Python SDK for MCP
 ]
 
 [project.optional-dependencies]
@@ -45,6 +46,7 @@ dev = [
 cerebellum-observatory = "cerebellum.observatory_main:main"
 cerebellum-arbiter     = "cerebellum.scripts.arbiter_loop:main"
 cerebellum-cortex      = "cerebellum.scripts.generate_hypotheses:main"
+cerebellum-mcp       = "cerebellum.mcp.server:main"
 
 [project.urls]
 Repository = "https://github.com/jcartu/cerebellum"
