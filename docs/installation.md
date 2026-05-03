@@ -84,7 +84,7 @@ This creates `.venv/` and installs the package in editable mode along with dev d
 
 ```bash
 make check
-# → ruff lint clean, mypy strict clean, 615 tests pass
+# → ruff lint clean, mypy strict clean, 700+ tests pass
 ```
 
 ## 3. Optional: set up the Telegram bot
