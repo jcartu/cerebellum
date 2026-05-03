@@ -15,6 +15,7 @@ from typing import Any
 
 import kuzu
 
+from cerebellum.cypher_safety import is_cypher_safe
 from cerebellum.http_client import safe_post_bytes
 from cerebellum.mining import (
     mine_patterns,
@@ -782,31 +783,8 @@ User request: {natural_language}
         return {}
 
     def _is_safe_read_query(self, query: str) -> bool:
-        candidate = query.strip()
-        if not candidate:
-            return False
-        if ";" in candidate:
-            return False
-
-        # Strip string literals so keywords inside string values don't trigger false positives
-        stripped = re.sub(r"'[^']*'", "''", candidate)
-        stripped = re.sub(r'"[^"]*"', '""', stripped)
-
-        for keyword in self._READ_ONLY_BLOCKED_KEYWORDS:
-            if re.search(r"\b" + keyword + r"\b", stripped, re.IGNORECASE):
-                return False
-
-        first_word = candidate.split()[0].upper() if candidate.split() else ""
-        if first_word not in self._READ_ONLY_QUERY_PREFIXES:
-            return False
-
-        # CALL whitelist: restrict to known-safe procedures
-        if first_word == "CALL" and len(candidate.split()) >= 2:
-            proc = candidate.split()[1].strip("()")
-            if proc not in self._ALLOWED_CALL_PROCEDURES:
-                return False
-
-        return True
+        """Delegate to the real Cypher tokenizer for safety validation."""
+        return is_cypher_safe(query)
 
     def _strip_query_comments(self, query: str) -> str:
         without_block_comments = re.sub(r"/\*.*?\*/", "", query, flags=re.DOTALL)
