@@ -13,6 +13,7 @@ import argparse
 import json
 import logging
 import sys
+from collections.abc import AsyncIterator
 from typing import Any
 
 from mcp.server import Server
@@ -171,7 +172,7 @@ class CerebellumMCPServer:
     def _register_handlers(self) -> None:
         """Register all MCP tool handlers."""
 
-        @self.server.list_tools()
+        @self.server.list_tools()  # type: ignore[no-untyped-call, untyped-decorator]
         async def list_tools() -> list[Tool]:
             return [
                 Tool(
@@ -182,7 +183,7 @@ class CerebellumMCPServer:
                 for name, (_, desc, schema) in TOOL_DEFINITIONS.items()
             ]
 
-        @self.server.call_tool()
+        @self.server.call_tool()  # type: ignore[untyped-decorator]
         async def call_tool(name: str, arguments: dict[str, Any] | None = None) -> CallToolResult:
             handler_info = TOOL_DEFINITIONS.get(name)
             if handler_info is None:
@@ -196,9 +197,7 @@ class CerebellumMCPServer:
 
             try:
                 result = handler(**args)
-                if isinstance(result, list):
-                    text = json.dumps(result, indent=2, default=str)
-                elif isinstance(result, dict):
+                if isinstance(result, (list, dict)):
                     text = json.dumps(result, indent=2, default=str)
                 else:
                     text = str(result)
@@ -223,9 +222,10 @@ class CerebellumMCPServer:
 
     async def run_sse(self, port: int = 8765, bind: str = "127.0.0.1") -> None:
         """Run the server over SSE transport with auth."""
-        from cerebellum.mcp.auth import check_rate_limit, get_mcp_token, validate_token
         from fastapi import FastAPI, HTTPException, Request
         from sse_starlette.sse import EventSourceResponse
+
+        from cerebellum.mcp.auth import check_rate_limit, get_mcp_token, validate_token
 
         app = FastAPI(title="CEREBELLUM MCP Server (SSE)")
         expected_token = get_mcp_token()
@@ -243,7 +243,7 @@ class CerebellumMCPServer:
             if expected_token and not validate_token(provided_token, expected_token):
                 raise HTTPException(status_code=401, detail="Invalid token")
 
-            client_ip = request.headers.get("X-Forwarded-For", request.client.host)
+            client_ip = request.headers.get("X-Forwarded-For", (request.client.host if request.client else "unknown"))
             if not check_rate_limit(client_ip):
                 raise HTTPException(status_code=429, detail="Rate limit exceeded")
 
@@ -255,7 +255,7 @@ class CerebellumMCPServer:
 
         @app.get("/sse")
         async def sse_endpoint() -> EventSourceResponse:
-            async def event_generator():
+            async def event_generator() -> AsyncIterator[dict[str, str]]:
                 yield {"event": "open", "data": "connected"}
 
             return EventSourceResponse(event_generator())

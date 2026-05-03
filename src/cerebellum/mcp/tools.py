@@ -7,20 +7,6 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from cerebellum.mcp.schemas import (
-    EmitEventInput,
-    EntityLookupInput,
-    KillSwitchStateOutput,
-    ProposeActionInput,
-    RecentEventsInput,
-    RecentEpisodesInput,
-    RecentProposalsInput,
-    SetKillSwitchInput,
-    SnoozeProposalInput,
-    SuccessorPatternsInput,
-    SystemMetricsOutput,
-)
-
 logger = logging.getLogger(__name__)
 
 # Lazy imports to avoid circular deps at module load time
@@ -358,7 +344,7 @@ def set_kill_switch(enabled: bool, reason: str) -> dict[str, Any]:
 
     approval_id = f"killswitch-{__import__('uuid').uuid4()}"
     # Create a pending proposal for the kill switch toggle
-    hypothesis = {
+    {
         "id": approval_id,
         "title": f"Kill switch {'enable' if enabled else 'disable'}",
         "description": f"MCP client requested kill switch {'enable' if enabled else 'disable'}: {reason}",

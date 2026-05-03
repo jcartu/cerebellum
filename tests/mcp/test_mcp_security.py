@@ -120,7 +120,7 @@ class TestAuthSecurity:
         assert validate_token("", "") is False
 
     def test_rate_limit_is_per_ip(self):
-        from cerebellum.mcp.auth import check_rate_limit, _rate_windows
+        from cerebellum.mcp.auth import _rate_windows, check_rate_limit
         _rate_windows.clear()
         # IP 1 should be limited
         for _ in range(5):

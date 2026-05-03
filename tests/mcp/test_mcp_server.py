@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock, patch
-
-import pytest
+from unittest.mock import MagicMock
 
 from cerebellum.mcp.server import CerebellumMCPServer
 
@@ -17,7 +15,6 @@ class TestServerListTools:
         loop = asyncio.new_event_loop()
         try:
             # Call the list_tools handler registered on the server
-            handler = server.server.request_handlers.get
             from mcp.types import ListToolsRequest
             list_handler = server.server.request_handlers.get(ListToolsRequest)
             assert list_handler is not None
@@ -84,7 +81,7 @@ class TestServerAuth:
         assert check_rate_limit("127.0.0.1", max_requests=100) is True
 
     def test_rate_limit_blocks_excess(self):
-        from cerebellum.mcp.auth import check_rate_limit, _rate_windows
+        from cerebellum.mcp.auth import _rate_windows, check_rate_limit
         _rate_windows.clear()
         for _ in range(5):
             check_rate_limit("10.0.0.1", max_requests=5)
