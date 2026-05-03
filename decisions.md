@@ -475,3 +475,46 @@ This list is what goes in the README's "Limitations" section in Phase 1 and gets
 
 ### Opus spend
 - **Total Opus token spend across rebuild: ~$1** (unchanged)
+
+## Repo polish pass — 2026-05-03
+- **Started:** 2026-05-03
+- **Completed:** 2026-05-03
+- **Branch:** polish/repo-presentation
+- **Type:** Documentation / housekeeping; no code changes
+- **Exit gate result:** PASS (663 tests, 15/15 checks)
+
+### What shipped
+- New README positioning CEREBELLUM as a proactive ops layer for autonomous agents, with explicit comparison table covering RASPUTIN, Letta, Mem0, Zep, Graphiti, Hindsight, and LangChain/LlamaIndex memory primitives.
+- New CONTRIBUTING.md with branch conventions, PR requirements, scope guidelines.
+- New CHANGELOG.md covering Phases 0 through 6 Final Cleanup.
+- New LICENSE (Apache 2.0).
+- New docs: comparisons.md, installation.md, security-model.md, configuration.md.
+- Replaced SECURITY.md with vulnerability-disclosure-focused version (operational content moved to docs/security-model.md). Added josh@cartu.com as disclosure contact.
+- Cleaned `.gitignore` to cover .coverage, coverage.xml, metrics.db, .pytest_cache, .mypy_cache, .ruff_cache, .hypothesis, and runtime state files.
+- Removed committed build artifacts: .coverage, coverage.xml, metrics.db, config.json.
+- Renamed cron config files to match operational naming (cortex→proposer, hippocampus→episode, causal→successor).
+- Updated .env.example with all documented env vars (TELEGRAM_WEBHOOK_SECRET, TELEGRAM_ALLOWED_USER_IDS, BRAVE_SEARCH_API_KEY, NATS TLS vars, CEREBELLUM_LOG_LEVEL, CEREBELLUM_DRY_RUN).
+- Fixed conftest.py to create test config.json at runtime so tests work without committed config.
+
+### Why
+The Phase 6 final cleanup finished with a working, audited, well-tested system. The repo presentation didn't reflect that — README mentioned RASPUTIN once without explaining what it was, no comparison table, no LICENSE, no CHANGELOG, build artifacts in git. This pass closes the gap between "engineering is done" and "repo looks like the engineering is done."
+
+### Decisions made without Opus
+- Apache 2.0 license (matches typical Python OSS, permissive enough for adoption, requires attribution).
+- Comparison table includes RASPUTIN, Letta, Mem0, Zep, Graphiti, Hindsight as the primary memory-system landscape; LangChain/LlamaIndex memory primitives noted separately as in-agent components rather than peer systems.
+- Single PR rather than per-doc PRs to keep history clean.
+- conftest.py creates config.json at test runtime instead of committing it (avoids secrets/paths leaking into repo).
+
+### Opus calls
+| # | Date | Question | Response summary | Action taken |
+|---|------|----------|------------------|--------------|
+| 0 | — | — | No Opus calls this phase | — |
+
+### Metrics snapshot
+- Tests: 663 (unchanged)
+- Coverage: 84% (unchanged)
+- New files: 6 (README, CONTRIBUTING, CHANGELOG, LICENSE + 4 docs)
+- Replaced files: 3 (SECURITY.md, .gitignore, conftest.py)
+- Removed files: 4 build artifacts
+- Renamed files: 3 cron configs
+- Opus token spend this phase: $0

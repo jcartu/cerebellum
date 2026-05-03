@@ -6,6 +6,20 @@ dist/
 build/
 *.egg
 
+# Virtual environments
+.venv/
+venv/
+
+# Test / coverage artifacts
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+
 # Runtime databases
 events.db
 events.db-shm
@@ -14,10 +28,31 @@ hypotheses.db
 hypotheses.db-shm
 hypotheses.db-wal
 feedback.db
+feedback.db-shm
+feedback.db-wal
+metrics.db
+metrics.db-shm
+metrics.db-wal
 
 # Graph database
 graph/
 
-# Environment
+# Local configuration (commit only the .example variant)
+config.json
 .env
-.venv/
+
+# State files
+kill_switch.flag
+arbiter_decisions.jsonl
+pending_approvals.json
+calibration.json
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# OS
+Thumbs.db
