@@ -37,7 +37,7 @@ Required tools (installed by `make install`): `ruff`, `mypy`, `pytest`, `hypothe
 
 In rough order of priority:
 
-1. **Test coverage on `episode_store.py`.** Currently the lowest-covered first-party module at 81%. Tests for the LLM-Cypher generation path are particularly welcome.
+1. **Test coverage on `episode_store.py`.** Currently the lowest-covered first-party module at 82%. Tests for the LLM-Cypher generation path are particularly welcome.
 2. **Bug fixes** with reproducible test cases.
 3. **Documentation improvements** — especially the deployment guide and the security threat model.
 4. **New tool handlers** for the policy arbiter, with the constraint that any handler doing side effects must default to `forbidden_tools` (approval-only) until proven safe.
