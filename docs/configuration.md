@@ -15,7 +15,10 @@ CEREBELLUM is configured by three files. This page is the complete reference for
 | `TELEGRAM_WEBHOOK_SECRET` | If using Telegram | Secret token for webhook auth. Generate with `openssl rand -hex 32`. |
 | `TELEGRAM_ALLOWED_USER_IDS` | If using Telegram | Comma-separated numeric user IDs allowed to approve. |
 | `BRAVE_SEARCH_API_KEY` | If using `web.search` | Brave Search API key. |
-| `CEREBELLUM_NATS_TLS_CA` | If using NATS TLS | Path to CA cert (PEM). |
+| `CEREBELLUM_NATS_TLS_CA` | If using NATS TLS | Path to CA cert (PEM).
+| `CEREBELLUM_NATS_TLS_CERT` | If using mTLS | Path to client cert (PEM).
+| `CEREBELLUM_NATS_TLS_KEY` | If using mTLS | Path to client private key (PEM).
+| `CEREBELLUM_MCP_TOKEN` | If using MCP SSE | Bearer token for MCP Server SSE transport. Generate with `openssl rand -hex 32`.
 | `CEREBELLUM_NATS_TLS_CERT` | If using mTLS | Path to client cert (PEM). |
 | `CEREBELLUM_NATS_TLS_KEY` | If using mTLS | Path to client private key (PEM). |
 
@@ -169,7 +172,31 @@ The arbiter dispatches to handlers based on `tools_required` in the proposal. Av
 | `notification.summarize` | Send | auto | Summarize last hour of events to Telegram. Idempotent. |
 | `proposal.snooze` | State | auto | Mark a proposal as "remind me later." |
 | `model.call` | Read | stage | Make an additional LLM call. |
-| `file.read` | Read | auto | Read a file in `${CEREBELLUM_BASE_DIR}` allowlist. |
+| `file.read` | Read | auto | Read a file in `${CEREBELLUM_BASE_DIR}` allowlist.
+
+## MCP Server
+
+The MCP Server is configured entirely via environment variables:
+
+|| Variable | Required | Description |
+| :--- | :--- | :--- |
+| `CEREBELLUM_MCP_TOKEN` | SSE only | Bearer token for SSE transport authentication. Generate with `openssl rand -hex 32`. |
+| `CEREBELLUM_CONFIG` | No | Path to `config.json` (default: project root). |
+| `CEREBELLUM_POLICY` | No | Path to `policy.yaml` (default: project root). |
+
+The server supports two transports:
+
+- **stdio** (default): Used by Claude Desktop, Claude Code, and other local MCP clients. Run with `cerebellum-mcp`.
+- **SSE** (HTTP): Used by remote clients. Run with `cerebellum-mcp --transport sse --host 0.0.0.0 --port 8765`. Requires `CEREBELLUM_MCP_TOKEN` for Bearer token auth.
+
+### Security
+
+- SSE transport requires Bearer token authentication using constant-time token comparison.
+- Rate limiting: 60 requests per minute per IP.
+- Kill switch toggle always returns `pending_approval` — never auto-executes.
+- All write tools validate required fields before execution.
+
+For the full tool reference and examples, see [`docs/mcp-server.md`](mcp-server.md).
 
 To override the default for any tool, list it in `auto_execute.allowed_tools`, `forbidden_tools`, or neither (which defaults to `stage_notify` if it meets `stage_notify` thresholds).
 
@@ -179,8 +206,9 @@ Beyond the secrets in `.env`, a few env vars control behavior:
 
 | Variable | Default | Description |
 | :--- | :--- | :--- |
-| `CEREBELLUM_BASE_DIR` | (project dir) | Where state files live. |
-| `CEREBELLUM_LOG_LEVEL` | `INFO` | Python logging level (`DEBUG`, `INFO`, `WARNING`, `ERROR`). |
-| `CEREBELLUM_DRY_RUN` | `0` | If `1`, the arbiter logs decisions but does not execute. |
+| `CEREBELLUM_BASE_DIR` | (project dir) | Where state files live.
+| `CEREBELLUM_LOG_LEVEL` | `INFO` | Python logging level (`DEBUG`, `INFO`, `WARNING`, `ERROR`).
+| `CEREBELLUM_DRY_RUN` | `0` | If `1`, the arbiter logs decisions but does not execute.
+| `CEREBELLUM_MCP_TOKEN` | (none) | Bearer token for MCP Server SSE transport authentication. Generate with `openssl rand -hex 32`.
 
 Set these in `.env` or pass them in the systemd `Environment=` directive.

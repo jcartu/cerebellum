@@ -26,11 +26,18 @@ graph TD
         Action -->|Feedback| EventBus
     end
 
+    subgraph External
+        MCPClient[AI Assistant (MCP)] --> MCPServer
+    end
+
     subgraph Persistence
         EventBus -.->|Write| EventsDB[(events.db)]
         EpisodeStore -.->|Read/Write| GraphDB[(graph/)]
         Proposer -.->|Write| HypothesesDB[(hypotheses.db)]
         Action -.->|Log| FeedbackDB[(feedback.db)]
+        MCPServer -.->|Read| EventsDB
+        MCPServer -.->|Read| GraphDB
+        MCPServer -.->|Read| HypothesesDB
     end
 ```
 
@@ -51,6 +58,8 @@ The PolicyArbiter evaluates proposed hypotheses against a set of YAML-defined po
 ### Dashboard
 The Dashboard provides a real-time interface for monitoring the event stream and managing proposed hypotheses. Built with FastAPI and HTMX, it allows users to approve or reject staged proposals and integrates with Telegram for remote notifications and decision-making. It serves as the primary human-in-the-loop interface for the system.
 
+### MCP Server
+The MCP Server (`src/cerebellum/mcp/`) exposes a Model Context Protocol interface for AI assistants to query and interact with CEREBELLUM. It provides 12 tools (8 read-only, 4 write) including event querying, episode lookup, proposal management, and kill switch state checks. The server supports two transports: stdio (for local MCP clients like Claude Desktop) and SSE (for remote clients with Bearer token authentication). All write operations are gated through the policy arbiter — the kill switch toggle always requires approval and never auto-executes.
 ## Persistence Layer
 
 - **events.db (SQLite WAL)**: A persistent store for the raw history of all ingested events, optimized for high-frequency writes.
@@ -58,10 +67,13 @@ The Dashboard provides a real-time interface for monitoring the event stream and
 - **graph/ (KuzuDB)**: A graph database that maintains the structure of events, episodes, and their statistical co-occurrence patterns.
 - **feedback.db (SQLite)**: A storage layer for recording the outcomes and feedback from executed proposals to inform future system behavior.
 - **NATS JetStream**: A distributed messaging system used for reliable, real-time event streaming between components.
+- **CEREBELLUM_MCP_TOKEN**: Environment variable for MCP Server SSE transport authentication.
 
 ## Configuration
 
 - **config.json**: The primary configuration file containing system-level settings, API credentials for OpenRouter, and connection parameters for NATS.
+- **policy.yaml**: A YAML-based policy engine configuration that defines the rules, thresholds, and safety constraints used by the PolicyArbiter.
+- **CEREBELLUM_MCP_TOKEN**: Bearer token for MCP Server SSE transport authentication (environment variable).
 - **policy.yaml**: A YAML-based policy engine configuration that defines the rules, thresholds, and safety constraints used by the PolicyArbiter.
 
 ## Data Flow

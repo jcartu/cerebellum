@@ -4,9 +4,9 @@ Thanks for considering a contribution. CEREBELLUM is alpha software run by its a
 
 ## Ground rules
 
-- **Every change ships with tests.** No exceptions. The test suite is at 81% coverage and we don't ship regressions.
+- **Every change ships with tests.** No exceptions. The test suite is at 82% coverage (700+ tests) and we don't ship regressions.
 - **Every public function has type hints.** mypy `strict = true` runs in CI on all first-party modules. There are no first-party modules in the override list.
-- **Security-critical paths get property tests.** RateLimiter, DailyCostTracker, Cypher filter, SSRF validator, kill switch — these have Hypothesis property tests. New code in these areas needs property tests too.
+- **Security-critical paths get property tests.** RateLimiter, DailyCostTracker, Cypher tokenizer, SSRF validator, kill switch — these have Hypothesis property tests. New code in these areas needs property tests too.
 - **No secrets in commits.** Pre-commit hooks check this. If you slip one through, we revert and force-push the rewritten history; you'll need to rebase.
 - **No new dependencies without justification.** Adding a dep means writing the rationale in the PR description. "It's nice" is not a rationale.
 
@@ -37,7 +37,7 @@ Required tools (installed by `make install`): `ruff`, `mypy`, `pytest`, `hypothe
 
 In rough order of priority:
 
-1. **Test coverage on `episode_store.py`.** Currently the lowest-covered first-party module at 69%. Tests for the LLM-Cypher generation path are particularly welcome.
+1. **Test coverage on `episode_store.py`.** Currently the lowest-covered first-party module at 81%. Tests for the LLM-Cypher generation path are particularly welcome.
 2. **Bug fixes** with reproducible test cases.
 3. **Documentation improvements** — especially the deployment guide and the security threat model.
 4. **New tool handlers** for the policy arbiter, with the constraint that any handler doing side effects must default to `forbidden_tools` (approval-only) until proven safe.

@@ -2,16 +2,28 @@
 
 All notable changes to CEREBELLUM are documented here. The format is loosely based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows phase-based versioning during alpha.
 
-## [Unreleased]
+## Phase 7 — 2026-05-03
 
-### Planned
+**MCP Server & Hardening.** MCP Server with 12 tools, state-machine Cypher tokenizer, Telegram hardening, NATS mTLS tests, supply chain CI.
 
-- Real Cypher tokenizer (Phase 7) replacing the current regex-based string-literal stripping.
-- Mutual TLS for NATS (Phase 7) — currently server verification only.
-- Telegram webhook IP allowlist + replay protection beyond the existing `update_id` deduplication.
-- ≥90% coverage on security-critical paths.
-- SAST + dependency audit + secret scanning in CI.
+### Added
 
+- **MCP Server** (`src/cerebellum/mcp/`): 12 tools (8 read, 4 write), auth middleware (constant-time token compare, 60 req/min rate limit), stdio + SSE transports, 48 tests. `docs/mcp-server.md` documentation.
+- **Cypher Tokenizer** (`src/cerebellum/cypher_safety.py`): State-machine lexer replacing regex filter. Properly handles token boundaries (string literals, comments, labels, parameters). 97 tests (27 regression + 70 new), 96% coverage.
+- **NATS mTLS Tests** (`tests/test_nats_mtls.py`): 6 tests for TLS context creation, mTLS cert/key loading, env var overrides, scheme selection.
+- **Telegram Hardening** (`src/cerebellum/telegram_hardening.py`): `TelegramWebhookGuard` with IP allowlist (13 Telegram CIDR ranges) + nonce-based replay protection. 17 tests, 98% coverage.
+- **Supply Chain CI** (`scripts/supply_chain.sh`): pip-audit, bandit, gitleaks, dependency pinning checks.
+
+### Changed
+
+- `episode_store._is_safe_read_query()` now delegates to `is_cypher_safe()` from `cypher_safety.py`.
+- README, docs, CHANGELOG updated to reflect Phase 7 deliverables.
+
+### Metrics
+
+- Tests: 663 → 700+ (+37+ new tests)
+- Coverage: 81% → 82% global, 96% cypher_safety, 98% telegram_hardening, 77% tools.py, 94% auth.py
+- Opus token spend: $0
 ---
 
 ## Phase 6 Redo (Final) — 2026-05-03

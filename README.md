@@ -10,8 +10,8 @@ CEREBELLUM watches what your agent does, learns the patterns, and proposes the n
 
 [![Status](https://img.shields.io/badge/status-alpha-orange)](#status)
 [![Python](https://img.shields.io/badge/python-3.11%20%7C%203.12-blue)](https://www.python.org/downloads/)
-[![Tests](https://img.shields.io/badge/tests-615%20passing-brightgreen)](#testing)
-[![Coverage](https://img.shields.io/badge/coverage-81%25-brightgreen)](#testing)
+[![Tests](https://img.shields.io/badge/tests-700%2B%20passing-brightgreen)](#testing)
+[![Coverage](https://img.shields.io/badge/coverage-82%25-brightgreen)](#testing)
 [![mypy](https://img.shields.io/badge/mypy-strict-blue)](https://mypy-lang.org)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 
@@ -212,8 +212,9 @@ The result: an operator who can supervise an autonomous agent the way a senior e
 | **Proposer** | Grounded LLM proposals with evidence requirements | `hypotheses.db` |
 | **GroundingVerifier** | Cheap-model second-pass verification of proposals | (in-memory) |
 | **PolicyArbiter** | YAML policy, kill switch, budget caps, action dispatch | `arbiter_decisions.jsonl`, `kill_switch.flag` |
-| **FeedbackLoop** | Outcome tracking, Platt-scaled calibration | `feedback.db` |
-| **Dashboard** | FastAPI + HTMX, Telegram webhook | (in-memory + state files) |
+|| **MCP Server** | Model Context Protocol server for AI assistant integration | `CEREBELLUM_MCP_TOKEN` |
+|| **FeedbackLoop** | Outcome tracking, Platt-scaled calibration | `feedback.db` |
+|| **Dashboard** | FastAPI + HTMX, Telegram webhook | (in-memory + state files) |
 
 For full architectural detail, see [`docs/architecture.md`](docs/architecture.md).
 
@@ -223,7 +224,7 @@ For full architectural detail, see [`docs/architecture.md`](docs/architecture.md
 
 ### Prerequisites
 
-- Python 3.11 or 3.12
+- Python 3.11, 3.12, or 3.14
 - A NATS server with JetStream enabled (see [docs/installation.md](docs/installation.md) for setup)
 - An OpenRouter API key (or any OpenAI-compatible endpoint)
 - Optional: a Telegram bot for approvals
@@ -328,12 +329,14 @@ CEREBELLUM is paranoid by default. Threat-model summary:
 - **Tool allowlist.** Only tools listed in `auto_execute.allowed_tools` run without approval. Anything in `forbidden_tools` never runs.
 - **Kill switch.** A `flock`-protected file flag halts the system instantly, cross-process. Toggle from Telegram or the dashboard.
 - **Budget caps.** Sliding-window action rate limit, daily LLM spend cap, per-tool execution-cost estimates.
-- **Telegram authentication.** HMAC secret tokens, user-ID allowlists, and SQLite-backed `update_id` deduplication to prevent webhook replay.
+- **Telegram authentication.** HMAC secret tokens, user-ID allowlists, IP allowlist (13 Telegram CIDR ranges), nonce-based replay protection, and SQLite-backed `update_id` deduplication.
 - **Dashboard authentication.** Bearer tokens required for all routes except `/healthz`. Binds to loopback by default.
-- **Cypher safety filter.** LLM-generated graph queries are rejected if they contain blocked keywords as identifiers (string literals are stripped before checking, so `WHERE n.name = "DROP table"` is correctly accepted). `CALL` queries are restricted to a known-read-only procedure whitelist.
+- **Cypher safety filter.** LLM-generated graph queries are validated by a state-machine tokenizer that understands token boundaries (string literals, comments, labels, parameters). Destructive keywords (`CREATE`, `DELETE`, `DETACH`, `SET`, `REMOVE`, `MERGE`, `DROP`, `ALTER`) as identifiers are rejected. `CALL` queries are restricted to a known-read-only procedure whitelist.
 - **NATS TLS.** Optional mutual TLS for all event bus traffic. Server verification or client cert auth via config or environment variables.
 - **Atomic writes.** State files use temp-file + fsync + rename to prevent corruption.
 - **Response caps.** Every outbound HTTP response has a byte limit to prevent memory exhaustion.
+- **MCP Server authentication.** Bearer token auth for SSE transport, constant-time token comparison, 60 req/min rate limiting. Kill switch toggle always requires approval — never auto-executes.
+- **Supply chain security.** `scripts/supply_chain.sh` runs pip-audit, bandit, gitleaks, and dependency pinning verification.
 
 For the full security threat model and audit history, see [`docs/security-model.md`](docs/security-model.md) and [`SECURITY.md`](SECURITY.md).
 
@@ -341,7 +344,7 @@ For the full security threat model and audit history, see [`docs/security-model.
 
 ## Status and roadmap
 
-**Current state:** alpha. The system runs cleanly, has 615 tests at 81% coverage, mypy strict on all first-party modules, property tests for safety-critical invariants, and a 10,000-iteration Telegram fuzzer. It is being run by the author against a production agent.
+**Current state:** alpha. The system runs cleanly, has 700+ tests at 82% coverage, mypy strict on all first-party modules, property tests for safety-critical invariants, a 10,000-iteration Telegram fuzzer, and an MCP server for AI assistant integration. It is being run by the author against a production agent.
 
 **Known limitations** (in scope for future work):
 
@@ -349,10 +352,10 @@ For the full security threat model and audit history, see [`docs/security-model.
 - Confidence calibration via Platt scaling activates only after ≥100 outcomes per proposer model. Until then, raw confidence is used.
 - Reversal detection (was an auto-executed action later undone?) is a stub. Currently the auto-execute surface is read-only by design, so there's nothing to detect; this becomes relevant when destructive tools are added.
 - Single-host deployment is assumed. Multi-host requires NATS TLS + cert pinning (config flags exist but the deployment guide is not written yet).
+- MCP Server is read-only by default; write tools require approval and are gated through the policy arbiter.
 
 **Roadmap:**
 
-- **Phase 7 (planned):** real Cypher tokenizer (replace regex-based string-literal stripping), mutual TLS for NATS, Telegram webhook IP allowlist + replay protection beyond the existing `update_id` dedup, ≥90% coverage on security-critical paths, SAST + dependency audit + secret scanning in CI.
 - **Phase 8+:** integration with multiple memory backends, learnable verifier prompts, per-user policy profiles, multi-host deployment guide.
 
 See [`CHANGELOG.md`](CHANGELOG.md) for what shipped in each phase.
@@ -362,7 +365,7 @@ See [`CHANGELOG.md`](CHANGELOG.md) for what shipped in each phase.
 ## Testing
 
 ```bash
-make test               # 615 unit + property tests, ~2 min
+make test               # 700+ unit + property tests, ~2 min
 make test-integration   # requires running NATS + KuzuDB
 make typecheck          # mypy strict
 make lint               # ruff
@@ -372,8 +375,10 @@ make check              # all of the above
 The test suite includes:
 
 - **Unit tests:** behavioral coverage of every module, ≥80% global, ≥75% on `policy_arbiter.py` and `dashboard.py`.
-- **Property tests** (Hypothesis): RateLimiter invariants, DailyCostTracker arithmetic, Cypher filter consistency, SSRF validator coverage of every private/loopback/link-local/metadata IP class.
+- **Property tests** (Hypothesis): RateLimiter invariants, DailyCostTracker arithmetic, Cypher tokenizer consistency, SSRF validator coverage of every private/loopback/link-local/metadata IP class.
 - **Fuzz tests:** 10,000-iteration Telegram webhook fuzzer with reproducible seeds, exercising oversized fields, missing fields, type confusion, Unicode tricks, replay attacks, and recursive payloads.
+- **MCP tests:** 48 tests covering tool dispatch, auth middleware, SSE transport, and security invariants.
+- **Cypher tokenizer tests:** 97 tests (27 regression + 70 new) for the state-machine Cypher safety validator.
 
 CI runs on Python 3.11 and 3.12. Pull requests that drop coverage by more than 2 percentage points are blocked.
 
@@ -387,7 +392,8 @@ CI runs on Python 3.11 and 3.12. Pull requests that drop coverage by more than 2
 | [`docs/installation.md`](docs/installation.md) | NATS setup, Telegram bot setup, TLS hardening |
 | [`docs/configuration.md`](docs/configuration.md) | Full reference for `config.json`, `policy.yaml`, environment variables |
 | [`docs/security-model.md`](docs/security-model.md) | Threat model, audit history, hardening assumptions |
-| [`docs/comparisons.md`](docs/comparisons.md) | Detailed comparison with Letta, Mem0, Zep, Graphiti, RASPUTIN |
+|| [`docs/comparisons.md`](docs/comparisons.md) | Detailed comparison with Letta, Mem0, Zep, Graphiti, RASPUTIN |
+|| [`docs/mcp-server.md`](docs/mcp-server.md) | MCP Server tools, transports, security, configuration |
 | [`SECURITY.md`](SECURITY.md) | How to report vulnerabilities |
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) | How to contribute |
 | [`CHANGELOG.md`](CHANGELOG.md) | Per-phase change log |
