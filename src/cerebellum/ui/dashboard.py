@@ -11,7 +11,6 @@ import sqlite3
 import sys
 import threading
 import time
-from cerebellum.http_client import safe_post_bytes
 from collections import Counter
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -23,6 +22,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
 from cerebellum.event_bus import EventBus
 from cerebellum.feedback_loop import FeedbackStore
+from cerebellum.http_client import safe_post_bytes
 from cerebellum.policy_arbiter import PolicyArbiter
 
 logger = logging.getLogger(__name__)

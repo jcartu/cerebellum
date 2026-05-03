@@ -1,10 +1,7 @@
 from __future__ import annotations
 
 import json
-import os
 from unittest.mock import AsyncMock, MagicMock, patch
-
-import pytest
 
 from cerebellum.event_bus import EventBus
 

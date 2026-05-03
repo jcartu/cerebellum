@@ -241,8 +241,8 @@ class TestHandleHttpGet:
         mock_response.status_code = 200
         mock_response.headers = {"content-type": "text/html"}
 
-        with patch("cerebellum.policy_arbiter.safe_request", return_value=mock_response):
-            with patch.object(arbiter, "_validate_url", return_value=("1.2.3.4", "example.com")):
+        with patch("cerebellum.policy_arbiter.safe_request", return_value=mock_response), \
+             patch.object(arbiter, "_validate_url", return_value=("1.2.3.4", "example.com")):
                 result = arbiter._handle_http_get({"url": "http://example.com"})
                 assert result["status"] == "ok"
                 assert result["http_status"] == 200
@@ -252,8 +252,8 @@ class TestHandleHttpGet:
         mock_response.status_code = 200
         mock_response.headers = {"content-type": "application/json"}
 
-        with patch("cerebellum.policy_arbiter.safe_request", return_value=mock_response):
-            with patch.object(arbiter, "_validate_url", return_value=("1.2.3.4", "example.com")):
+        with patch("cerebellum.policy_arbiter.safe_request", return_value=mock_response), \
+             patch.object(arbiter, "_validate_url", return_value=("1.2.3.4", "example.com")):
                 result = arbiter._handle_http_get({"url": "https://example.com/api"})
                 assert result["status"] == "ok"
 

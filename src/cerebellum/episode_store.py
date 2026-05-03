@@ -7,7 +7,6 @@ import logging
 import os
 import re
 import threading
-from cerebellum.http_client import safe_post_bytes
 from collections import Counter
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -16,6 +15,7 @@ from typing import Any
 
 import kuzu
 
+from cerebellum.http_client import safe_post_bytes
 from cerebellum.mining import (
     mine_patterns,
 )

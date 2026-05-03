@@ -4,12 +4,12 @@ import json
 import logging
 import os
 import sqlite3 as sqlite3_mod
-from cerebellum.http_client import safe_post_bytes
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from cerebellum.http_client import safe_post_bytes
 
 logger = logging.getLogger(__name__)
 
