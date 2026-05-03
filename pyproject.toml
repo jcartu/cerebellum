@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Proactive ops assistant for RASPUTIN: event bus, successor-pattern mining, LLM-proposed actions, policy-gated execution."
 readme = "README.md"
 requires-python = ">=3.11"
-license = { text = "Proprietary" }
+license = { text = "Apache-2.0" }
 authors = [{ name = "Joshua Cartu" }]
 keywords = ["agent", "ops", "memory", "rasputin"]
 classifiers = [

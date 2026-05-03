@@ -212,9 +212,9 @@ The result: an operator who can supervise an autonomous agent the way a senior e
 | **Proposer** | Grounded LLM proposals with evidence requirements | `hypotheses.db` |
 | **GroundingVerifier** | Cheap-model second-pass verification of proposals | (in-memory) |
 | **PolicyArbiter** | YAML policy, kill switch, budget caps, action dispatch | `arbiter_decisions.jsonl`, `kill_switch.flag` |
-|| **MCP Server** | Model Context Protocol server for AI assistant integration | `CEREBELLUM_MCP_TOKEN` |
-|| **FeedbackLoop** | Outcome tracking, Platt-scaled calibration | `feedback.db` |
-|| **Dashboard** | FastAPI + HTMX, Telegram webhook | (in-memory + state files) |
+| **MCP Server** | Model Context Protocol server for AI assistant integration | `CEREBELLUM_MCP_TOKEN` |
+| **FeedbackLoop** | Outcome tracking, Platt-scaled calibration | `feedback.db` |
+| **Dashboard** | FastAPI + HTMX, Telegram webhook | (in-memory + state files) |
 
 For full architectural detail, see [`docs/architecture.md`](docs/architecture.md).
 
