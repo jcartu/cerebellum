@@ -4,14 +4,12 @@ import json
 import logging
 import os
 import sqlite3 as sqlite3_mod
-import urllib.error
-import urllib.request
+from cerebellum.http_client import safe_post_bytes
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from cerebellum.http_safe import _safe_opener
 
 logger = logging.getLogger(__name__)
 
@@ -236,22 +234,22 @@ class GroundingVerifier:
             "messages": [{"role": "user", "content": prompt}],
             "temperature": 0.0,
         }
-        request = urllib.request.Request(
-            self.verifier_url,
-            data=json.dumps(payload).encode("utf-8"),
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {self.openrouter_api_key}",
-                "HTTP-Referer": self.site_url,
-                "X-Title": self.app_name,
-            },
-            method="POST",
-        )
+
 
         try:
-            with _safe_opener.open(request, timeout=60) as response:
-                response_payload = json.loads(response.read().decode("utf-8"))
-        except (TimeoutError, urllib.error.URLError, urllib.error.HTTPError, json.JSONDecodeError) as exc:
+            raw = safe_post_bytes(
+                self.verifier_url,
+                json=payload,
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {self.openrouter_api_key}",
+                    "HTTP-Referer": self.site_url,
+                    "X-Title": self.app_name,
+                },
+                timeout=60,
+            )
+            response_payload = json.loads(raw.decode("utf-8"))
+        except (TimeoutError, ValueError, json.JSONDecodeError) as exc:
             raise RuntimeError(f"OpenRouter request failed: {exc}") from exc
 
         content = self._read_nested_key(response_payload, "choices.0.message.content")

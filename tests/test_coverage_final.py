@@ -464,12 +464,8 @@ class TestPolicyArbiterTelegramSend:
         eb = EventBus(config)
         arb = PolicyArbiter(str(policy), emitter=eb)
 
-        mock_response = MagicMock()
-        mock_response.read = MagicMock(return_value=b'{"ok":true,"result":{"message_id":42}}')
-        mock_response.__enter__ = MagicMock(return_value=mock_response)
-        mock_response.__exit__ = MagicMock(return_value=False)
-
-        with patch("urllib.request.OpenerDirector.open", return_value=mock_response):
+        mock_response = b'{"ok":true,"result":{"message_id":42}}'
+        with patch("cerebellum.policy_arbiter.safe_post_bytes", return_value=mock_response):
             result = arb._send_telegram_message("test message")
             assert result["ok"] is True
 

@@ -11,8 +11,7 @@ import sqlite3
 import sys
 import threading
 import time
-import urllib.error
-import urllib.request
+from cerebellum.http_client import safe_post_bytes
 from collections import Counter
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -24,7 +23,6 @@ from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
 from cerebellum.event_bus import EventBus
 from cerebellum.feedback_loop import FeedbackStore
-from cerebellum.http_safe import _safe_opener
 from cerebellum.policy_arbiter import PolicyArbiter
 
 logger = logging.getLogger(__name__)
@@ -649,28 +647,24 @@ async def telegram_webhook(request: Request) -> JSONResponse:
 
 def _answer_callback(callback_id: str, text: str) -> None:
     try:
-        req = urllib.request.Request(
+        safe_post_bytes(
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery",
-            data=json.dumps({"callback_query_id": callback_id, "text": text}).encode(),
+            json={"callback_query_id": callback_id, "text": text},
             headers={"Content-Type": "application/json"},
-            method="POST",
+            timeout=10,
         )
-        with _safe_opener.open(req, timeout=10):
-            pass
     except Exception:
         logger.exception("Failed to answer callback %s", callback_id)
 
 
 def _send_telegram_text(chat_id: str | int, text: str) -> None:
     try:
-        req = urllib.request.Request(
+        safe_post_bytes(
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-            data=json.dumps({"chat_id": chat_id, "text": text}).encode(),
+            json={"chat_id": chat_id, "text": text},
             headers={"Content-Type": "application/json"},
-            method="POST",
+            timeout=10,
         )
-        with _safe_opener.open(req, timeout=10):
-            pass
     except Exception:
         logger.exception("Failed to send Telegram message to %s", chat_id)
 

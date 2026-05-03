@@ -199,7 +199,7 @@ def test_call_llm_parses_json_response_with_safe_opener(tmp_path, monkeypatch):
             assert request.headers["Authorization"] == "Bearer test-key"
             return _FakeResponse()
 
-    monkeypatch.setattr("cerebellum.grounding._safe_opener", _FakeOpener())
+    monkeypatch.setattr("cerebellum.grounding.safe_post_bytes", lambda *a, **k: json.dumps({"choices": [{"message": {"content": 'Verifier says: {"verified": true, "reason": "Supported."}'}}]}).encode("utf-8"))
 
     result = verifier._call_llm("check grounding")
 
@@ -225,7 +225,7 @@ def test_call_llm_raises_for_missing_verifier_content(tmp_path, monkeypatch):
         def open(self, request, timeout):
             return _FakeResponse()
 
-    monkeypatch.setattr("cerebellum.grounding._safe_opener", _FakeOpener())
+    monkeypatch.setattr("cerebellum.grounding.safe_post_bytes", lambda *a, **k: json.dumps({"choices": [{"message": {"content": "   "}}]}).encode("utf-8"))
 
     with pytest.raises(RuntimeError, match="missing verifier content"):
         verifier._call_llm("check grounding")

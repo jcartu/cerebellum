@@ -14,19 +14,16 @@ import threading
 import time
 import urllib.error
 import urllib.parse
-import urllib.request
 import uuid
 from collections import Counter, deque
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from http.client import HTTPSConnection
 from pathlib import Path
 from typing import Any
 
 import yaml  # type: ignore[import-untyped]
 
-from cerebellum.http_client import safe_post
-from cerebellum.http_safe import NoRedirectHandler, _safe_opener
+from cerebellum.http_client import safe_get, safe_post, safe_post_bytes, safe_request
 
 logger = logging.getLogger(__name__)
 
@@ -157,46 +154,6 @@ class DailyCostTracker:
                 "remaining": round(max(self.max_cost - self._spent, 0.0), 4),
             }
 
-
-class _PinnedHTTPSConnection(HTTPSConnection):
-    def __init__(self, *args: Any, connect_host: str, server_hostname: str | None = None, **kwargs: Any):
-        self._connect_host = connect_host
-        self._server_hostname = server_hostname
-        super().__init__(*args, **kwargs)
-
-    def connect(self) -> None:
-        self.host = self._connect_host
-        self.sock = self._create_connection((self._connect_host, self.port), self.timeout, self.source_address)  # type: ignore[attr-defined]
-        peer_ip = self._normalize_ip_address(self.sock.getpeername()[0])
-        expected_ip = self._normalize_ip_address(self._connect_host)
-        if peer_ip != expected_ip:
-            self.sock.close()
-            raise ValueError(f"Pinned HTTPS peer mismatch: expected {expected_ip}, got {peer_ip}")
-        if self._tunnel_host:  # type: ignore[attr-defined]
-            self._tunnel()  # type: ignore[attr-defined]
-        self.sock = self._context.wrap_socket(self.sock, server_hostname=self._server_hostname or self.host)  # type: ignore[attr-defined]
-
-    @staticmethod
-    def _normalize_ip_address(value: str) -> str:
-        return str(ipaddress.ip_address(value))
-
-
-class _PinnedHTTPSHandler(urllib.request.HTTPSHandler):
-    def __init__(self, connect_host: str, server_hostname: str):
-        super().__init__()
-        self._connect_host = connect_host
-        self._server_hostname = server_hostname
-
-    def https_open(self, req: urllib.request.Request) -> Any:
-        return self.do_open(
-            lambda host, **kwargs: _PinnedHTTPSConnection(
-                host,
-                connect_host=self._connect_host,
-                server_hostname=self._server_hostname,
-                **kwargs,
-            ),
-            req,
-        )
 
 
 class PolicyArbiter:
@@ -891,41 +848,27 @@ class PolicyArbiter:
             new_netloc = safe_ip
         rebuilt = parsed._replace(netloc=new_netloc).geturl()
 
-        request = urllib.request.Request(
-            rebuilt,
-            headers={
-                "User-Agent": "Cerebellum/1.0",
-                "Host": host_header,
-            },
+        # Use http_client with IP pinning for SSRF protection
+        response = safe_request(
+            "GET", url,
+            headers={"User-Agent": "Cerebellum/1.0", "Host": host_header},
+            timeout=20,
+            pin_to_ip=safe_ip,
         )
-        if parsed.scheme == "https":
-            opener = urllib.request.build_opener(
-                NoRedirectHandler(),
-                _PinnedHTTPSHandler(connect_host=safe_ip, server_hostname=parsed.hostname or ""),
-            )
-        else:
-            opener = urllib.request.build_opener(NoRedirectHandler())
-        with opener.open(request, timeout=20) as response:
-            if parsed.scheme == "http":
-                response_host = response.headers.get("Host")
-                if response_host is not None and response_host != host_header:
-                    raise ValueError(
-                        f"HTTP response Host header mismatch: expected {host_header}, got {response_host}"
-                    )
-            try:
-                http_status = getattr(response, "status", None)
-                content_type = response.headers.get("Content-Type")
-            except TypeError:
-                http_status = None
-                content_type = None
-            return {
-                "status": "ok",
-                "tool": "http.get",
-                "url": url,
-                "resolved_ip": safe_ip,
-                "http_status": http_status,
-                "content_type": content_type,
-            }
+        if parsed.scheme == "http":
+            response_host = response.headers.get("Host")
+            if response_host is not None and response_host != host_header:
+                raise ValueError(
+                    f"HTTP response Host header mismatch: expected {host_header}, got {response_host}"
+                )
+        return {
+            "status": "ok",
+            "tool": "http.get",
+            "url": url,
+            "resolved_ip": safe_ip,
+            "http_status": response.status_code,
+            "content_type": response.headers.get("content-type"),
+        }
 
     def _handle_web_search(self, step: dict[str, Any]) -> dict[str, Any]:
         query = str(step.get("query") or "")
@@ -934,17 +877,16 @@ class PolicyArbiter:
         brave_api_key = os.environ.get("BRAVE_SEARCH_API_KEY")
         if not brave_api_key:
             raise RuntimeError("BRAVE_SEARCH_API_KEY is not configured")
-        request = urllib.request.Request(
+        # Use http_client for safe GET
+        raw = safe_get(
             f"https://api.search.brave.com/res/v1/web/search?q={urllib.parse.quote(query)}",
             headers={
                 "Accept": "application/json",
                 "X-Subscription-Token": brave_api_key,
                 "User-Agent": "Cerebellum/1.0",
             },
-        )
-        MAX_RESPONSE_BYTES = 2 * 1024 * 1024  # 2 MiB
-        with _safe_opener.open(request, timeout=30) as response:
-            raw = response.read(MAX_RESPONSE_BYTES + 1)
+            timeout=30,
+        ).content
         if len(raw) > MAX_RESPONSE_BYTES:
             raise RuntimeError("web.search response exceeded 2 MiB cap")
         payload = json.loads(raw.decode("utf-8"))
@@ -978,14 +920,13 @@ class PolicyArbiter:
         if vector is None:
             raise ValueError("memory.query requires a vector payload")
         payload = json.dumps({"vector": vector, "limit": int(step.get("limit", 5))}).encode("utf-8")
-        request = urllib.request.Request(
+        # Use http_client for safe POST
+        raw = safe_post_bytes(
             f"{qdrant_url.rstrip('/')}/collections/{urllib.parse.quote(collection, safe='')}/points/search",
             data=payload,
             headers={"Content-Type": "application/json"},
+            timeout=30,
         )
-        MAX_RESPONSE_BYTES = 4 * 1024 * 1024
-        with _safe_opener.open(request, timeout=30) as response:
-            raw = response.read(MAX_RESPONSE_BYTES + 1)
         if len(raw) > MAX_RESPONSE_BYTES:
             raise RuntimeError("memory.query response exceeded 4 MiB cap")
         result = json.loads(raw.decode("utf-8"))
@@ -1003,19 +944,18 @@ class PolicyArbiter:
             "messages": step.get("messages")
             or [{"role": "user", "content": str(step.get("prompt") or "")}],
         }
-        request = urllib.request.Request(
+        # Use http_client for safe POST
+        raw = safe_post_bytes(
             "https://openrouter.ai/api/v1/chat/completions",
-            data=json.dumps(payload).encode("utf-8"),
+            json=payload,
             headers={
                 "Authorization": f"Bearer {api_key}",
                 "Content-Type": "application/json",
                 "HTTP-Referer": self._site_url(),
                 "X-Title": "CEREBELLUM",
             },
+            timeout=60,
         )
-        MAX_RESPONSE_BYTES = 8 * 1024 * 1024
-        with _safe_opener.open(request, timeout=60) as response:
-            raw = response.read(MAX_RESPONSE_BYTES + 1)
         if len(raw) > MAX_RESPONSE_BYTES:
             raise RuntimeError("model.call response exceeded 8 MiB cap")
         result = json.loads(raw.decode("utf-8"))
@@ -1225,25 +1165,21 @@ class PolicyArbiter:
         if keyboard:
             payload["reply_markup"] = {"inline_keyboard": keyboard}
 
-        request = urllib.request.Request(
-            f"https://api.telegram.org/bot{bot_token}/sendMessage",
-            data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-        )
+        # Use http_client for safe POST
         MAX_TELEGRAM_RESPONSE_BYTES = 256 * 1024  # 256 KiB
         try:
-            with _safe_opener.open(request, timeout=30) as response:
-                raw = response.read(MAX_TELEGRAM_RESPONSE_BYTES + 1)
+            raw = safe_post_bytes(
+                f"https://api.telegram.org/bot{bot_token}/sendMessage",
+                json=payload,
+                headers={"Content-Type": "application/json"},
+                timeout=30,
+            )
             if len(raw) > MAX_TELEGRAM_RESPONSE_BYTES:
                 raise RuntimeError("Telegram response exceeded 256 KiB cap")
             return json.loads(raw.decode("utf-8"))  # type: ignore[no-any-return]
-        except urllib.error.HTTPError as exc:
-            body_bytes = exc.read(MAX_TELEGRAM_RESPONSE_BYTES + 1)
-            if len(body_bytes) > MAX_TELEGRAM_RESPONSE_BYTES:
-                body = "<response truncated at 256 KiB>"
-            else:
-                body = body_bytes.decode("utf-8", errors="replace")
-            raise RuntimeError(f"Telegram API error {exc.code}: {body}") from exc
+        except Exception:
+            logger.exception("Failed to send Telegram message to %s", chat_id)
+            raise
 
     def _extract_execution_cost(self, step: dict[str, Any], result: dict[str, Any]) -> float:
         for source in (result, step):

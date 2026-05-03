@@ -7,8 +7,7 @@ import logging
 import os
 import re
 import threading
-import urllib.error
-import urllib.request
+from cerebellum.http_client import safe_post_bytes
 from collections import Counter
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -17,7 +16,6 @@ from typing import Any
 
 import kuzu
 
-from cerebellum.http_safe import _safe_opener
 from cerebellum.mining import (
     mine_patterns,
 )
@@ -725,22 +723,22 @@ User request: {natural_language}
             "messages": [{"role": "user", "content": prompt}],
             "temperature": 0.2,
         }
-        request = urllib.request.Request(
-            self.openrouter_url,
-            data=json.dumps(payload).encode("utf-8"),
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {self.openrouter_api_key}",
-                "HTTP-Referer": "https://localhost/cerebellum",
-                "X-Title": "CEREBELLUM",
-            },
-            method="POST",
-        )
+
 
         try:
-            with _safe_opener.open(request, timeout=60) as response:
-                response_payload = json.loads(response.read().decode("utf-8"))
-        except (TimeoutError, urllib.error.URLError, urllib.error.HTTPError, json.JSONDecodeError) as exc:
+            raw = safe_post_bytes(
+                self.openrouter_url,
+                json=payload,
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {self.openrouter_api_key}",
+                    "HTTP-Referer": "https://localhost/cerebellum",
+                    "X-Title": "CEREBELLUM",
+                },
+                timeout=60,
+            )
+            response_payload = json.loads(raw.decode("utf-8"))
+        except (TimeoutError, ValueError, json.JSONDecodeError) as exc:
             raise RuntimeError(f"OpenRouter request failed: {exc}") from exc
 
         try:

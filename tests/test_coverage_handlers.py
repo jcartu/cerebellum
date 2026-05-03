@@ -238,13 +238,10 @@ class TestHandleHttpGet:
 
     def test_http_get_valid_url(self, arbiter):
         mock_response = MagicMock()
-        mock_response.status = 200
-        mock_response.headers = {"Content-Type": "text/html"}
-        mock_response.__enter__ = MagicMock(return_value=mock_response)
-        mock_response.__exit__ = MagicMock(return_value=False)
+        mock_response.status_code = 200
+        mock_response.headers = {"content-type": "text/html"}
 
-        with patch("urllib.request.build_opener") as mock_opener:
-            mock_opener.return_value.open = MagicMock(return_value=mock_response)
+        with patch("cerebellum.policy_arbiter.safe_request", return_value=mock_response):
             with patch.object(arbiter, "_validate_url", return_value=("1.2.3.4", "example.com")):
                 result = arbiter._handle_http_get({"url": "http://example.com"})
                 assert result["status"] == "ok"
@@ -252,17 +249,13 @@ class TestHandleHttpGet:
 
     def test_http_get_https_path(self, arbiter):
         mock_response = MagicMock()
-        mock_response.status = 200
-        mock_response.headers = {"Content-Type": "application/json"}
-        mock_response.__enter__ = MagicMock(return_value=mock_response)
-        mock_response.__exit__ = MagicMock(return_value=False)
+        mock_response.status_code = 200
+        mock_response.headers = {"content-type": "application/json"}
 
-        with patch("urllib.request.build_opener") as mock_opener:
-            mock_opener.return_value.open = MagicMock(return_value=mock_response)
+        with patch("cerebellum.policy_arbiter.safe_request", return_value=mock_response):
             with patch.object(arbiter, "_validate_url", return_value=("1.2.3.4", "example.com")):
                 result = arbiter._handle_http_get({"url": "https://example.com/api"})
                 assert result["status"] == "ok"
-
 
 # ---------------------------------------------------------------------------
 # Handler tests - web.search

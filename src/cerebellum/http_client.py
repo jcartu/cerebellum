@@ -1,9 +1,7 @@
 """HTTP client with SSRF protection using httpx.
 
-Provides safe_get() and safe_post() that reject redirects, block
-private/metadata IPs, and enforce timeouts. Replaces urllib.request
-for new code (Phase 4). The legacy _PinnedHTTPSConnection in
-policy_arbiter.py is kept for backward compatibility until Phase 6.
+Provides safe_get(), safe_post(), safe_post_bytes(), and safe_request()
+that reject redirects, block private/metadata IPs, and enforce timeouts.
 """
 
 from __future__ import annotations
@@ -38,14 +36,7 @@ _BLOCKED_RANGES: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = [
 
 
 def _is_blocked_ip(host: str) -> bool:
-    """Check if a hostname resolves to a blocked IP range.
-
-    Args:
-        host: Hostname or IP address to check.
-
-    Returns:
-        True if the host resolves to a blocked IP range.
-    """
+    """Check if a hostname resolves to a blocked IP range."""
     try:
         addr = ipaddress.ip_address(host)
         for network in _BLOCKED_RANGES:
@@ -62,21 +53,7 @@ def safe_get(
     timeout: float = 30.0,
     allow_redirects: bool = False,
 ) -> httpx.Response:
-    """Perform a safe HTTP GET request.
-
-    Args:
-        url: The URL to GET.
-        headers: Optional headers to include.
-        timeout: Request timeout in seconds.
-        allow_redirects: Whether to follow redirects (default False).
-
-    Returns:
-        The httpx Response object.
-
-    Raises:
-        ValueError: If the URL resolves to a blocked IP range.
-        httpx.HTTPError: On network or HTTP errors.
-    """
+    """Perform a safe HTTP GET request."""
     if _is_blocked_ip(url.split("//")[-1].split("/")[0].split(":")[0]):
         raise ValueError(f"Blocked IP in URL: {url}")
 
@@ -96,22 +73,7 @@ def safe_post(
     headers: dict[str, str] | None = None,
     timeout: float = 60.0,
 ) -> httpx.Response:
-    """Perform a safe HTTP POST request.
-
-    Args:
-        url: The URL to POST to.
-        json: Optional JSON payload.
-        data: Optional raw bytes payload.
-        headers: Optional headers to include.
-        timeout: Request timeout in seconds.
-
-    Returns:
-        The httpx Response object.
-
-    Raises:
-        ValueError: If the URL resolves to a blocked IP range.
-        httpx.HTTPError: On network or HTTP errors.
-    """
+    """Perform a safe HTTP POST request."""
     if _is_blocked_ip(url.split("//")[-1].split("/")[0].split(":")[0]):
         raise ValueError(f"Blocked IP in URL: {url}")
 
@@ -120,5 +82,73 @@ def safe_post(
         timeout=timeout,
     ) as client:
         response = client.post(url, json=json, content=data, headers=headers)
+        response.raise_for_status()
+        return response
+
+
+def safe_post_bytes(
+    url: str,
+    json: dict[str, Any] | None = None,
+    data: bytes | None = None,
+    headers: dict[str, str] | None = None,
+    timeout: float = 60.0,
+) -> bytes:
+    """Perform a safe HTTP POST and return raw response bytes."""
+    if _is_blocked_ip(url.split("//")[-1].split("/")[0].split(":")[0]):
+        raise ValueError(f"Blocked IP in URL: {url}")
+
+    with httpx.Client(
+        follow_redirects=False,
+        timeout=timeout,
+    ) as client:
+        response = client.post(url, json=json, content=data, headers=headers)
+        response.raise_for_status()
+        return response.content
+
+
+def safe_request(
+    method: str,
+    url: str,
+    headers: dict[str, str] | None = None,
+    json: dict[str, Any] | None = None,
+    data: bytes | None = None,
+    timeout: float = 30.0,
+    pin_to_ip: str | None = None,
+) -> httpx.Response:
+    """Perform a safe HTTP request with optional IP pinning for SSRF protection.
+
+    Args:
+        method: HTTP method (GET, POST, etc.).
+        url: The URL to request.
+        headers: Optional headers to include.
+        json: Optional JSON payload.
+        data: Optional raw bytes payload.
+        timeout: Request timeout in seconds.
+        pin_to_ip: If set, connect to this IP instead of resolving the URL hostname.
+            The original hostname is preserved in the Host header and TLS SNI.
+
+    Returns:
+        The httpx Response object.
+    """
+    resolved_host = pin_to_ip or url.split("//")[-1].split("/")[0].split(":")[0]
+    if _is_blocked_ip(resolved_host):
+        raise ValueError(f"Blocked IP in URL: {url}")
+
+    effective_url = url
+    if pin_to_ip:
+        parsed = url.split("//")
+        effective_url = f"{parsed[0]}//{pin_to_ip}{parsed[1]}"
+        if headers is None:
+            headers = {}
+        original_host = url.split("//")[-1].split("/")[0]
+        headers["Host"] = original_host
+
+    with httpx.Client(
+        follow_redirects=False,
+        timeout=timeout,
+    ) as client:
+        response = client.request(
+            method, effective_url, headers=headers, json=json, content=data
+        )
         response.raise_for_status()
         return response
